@@ -147,6 +147,8 @@ class ConcatInfo:
     scope: Scope
     in_loop: bool = False
     loop_depth: int = 0
+    loop_scope: Optional[Scope] = None  # the innermost loop scope
+    right_expr: Optional[str] = None    # string repr of right side of concat
 
 
 class ASTAnalyzer:
@@ -625,6 +627,20 @@ class ASTAnalyzer:
             left_var = None
             if isinstance(value.left, Name):
                 left_var = value.left.id
+            
+            # get the right side expression
+            right_expr = self._node_to_string(value.right)
+            
+            # find innermost loop scope
+            loop_scope = None
+            if self.loop_depth > 0:
+                # walk up scopes to find loop
+                s = self.current_scope
+                while s:
+                    if s.scope_type == 'loop':
+                        loop_scope = s
+                        break
+                    s = s.parent
 
             self.concats.append(ConcatInfo(
                 target=target,
@@ -633,6 +649,8 @@ class ASTAnalyzer:
                 scope=self.current_scope,
                 in_loop=self.loop_depth > 0,
                 loop_depth=self.loop_depth,
+                loop_scope=loop_scope,
+                right_expr=right_expr,
             ))
         elif isinstance(value, (Number, String, TrueExpr, FalseExpr, Nil)):
             value_type = 'literal'
@@ -1061,18 +1079,46 @@ class ASTAnalyzer:
 
         for (scope, var), concats in loop_concats.items():
             if len(concats) >= 1:
+                concat_info = concats[0]
+                loop_scope = concat_info.loop_scope
+                
+                # check if variable is initialized to empty string before loop
+                init_line = None
+                is_safe = False
+                
+                if loop_scope:
+                    # look for var = "" or var = '' IMMEDIATELY before the loop
+                    # must be: within 3 lines, NOT inside any loop, and must be local declaration
+                    for assign in self.assigns:
+                        if (assign.target == var and 
+                            assign.value_type == 'literal' and
+                            assign.value_repr in ('""', "''") and
+                            assign.line < loop_scope.start_line and
+                            assign.line >= loop_scope.start_line - 3 and  # must be within 3 lines
+                            not assign.in_loop and  # init must NOT be inside any loop
+                            assign.is_local):  # must be a local declaration
+                            init_line = assign.line
+                            is_safe = True
+                            break
+                
                 self.findings.append(Finding(
                     pattern_name='string_concat_in_loop',
                     severity='YELLOW',
-                    line_num=concats[0].line,
+                    line_num=concat_info.line,
                     message=f'String concat in loop: {var} = {var} .. x',
                     details={
                         'variable': var,
                         'count': len(concats),
-                        'loop_depth': concats[0].loop_depth,
+                        'loop_depth': concat_info.loop_depth,
                         'suggestion': 'Use table.insert() + table.concat()',
+                        'right_expr': concat_info.right_expr,
+                        'loop_start': loop_scope.start_line if loop_scope else None,
+                        'loop_end': loop_scope.end_line if loop_scope else None,
+                        'init_line': init_line,
+                        'is_safe': is_safe,
+                        'concat_lines': [c.line for c in concats],
                     },
-                    source_line=self._get_source_line(concats[0].line),
+                    source_line=self._get_source_line(concat_info.line),
                 ))
 
     def _analyze_debug_statements(self):

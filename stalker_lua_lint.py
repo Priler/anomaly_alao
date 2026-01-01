@@ -71,13 +71,14 @@ def analyze_file_worker(args_tuple):
 
 def transform_file_worker(args_tuple):
     """Worker function for parallel transform_file calls."""
-    script_path, backup, fix_debug, fix_yellow = args_tuple
+    script_path, backup, fix_debug, fix_yellow, experimental = args_tuple
     try:
         modified, _, edit_count = transform_file(
             script_path,
             backup=backup,
             fix_debug=fix_debug,
             fix_yellow=fix_yellow,
+            experimental=experimental,
         )
         return (script_path, modified, edit_count, None)
     except Exception as e:
@@ -107,6 +108,11 @@ def main():
         "--fix-debug",
         action="store_true",
         help="Fix (DEBUG) entries automatically (comment out all: log, printf, print, etc.)"
+    )
+    parser.add_argument(
+        "--experimental",
+        action="store_true",
+        help="Enable experimental fixes (string concat in loops)"
     )
     parser.add_argument(
         "--backup",
@@ -370,7 +376,7 @@ def main():
     files_modified = 0
     total_edits = 0
 
-    if args.fix or args.fix_debug or args.fix_yellow:
+    if args.fix or args.fix_debug or args.fix_yellow or args.experimental:
         if True: # yes
             fix_msg = "Applying fixes"
             fix_types = []
@@ -380,11 +386,13 @@ def main():
                 fix_types.append("YELLOW")
             if args.fix_debug:
                 fix_types.append("DEBUG")
+            if args.experimental:
+                fix_types.append("EXPERIMENTAL")
             print(f"{fix_msg} ({', '.join(fix_types)}) with {num_workers} workers...")
 
             # prepare work items
             work_items = [
-                (script_path, args.backup, args.fix_debug, args.fix_yellow)
+                (script_path, args.backup, args.fix_debug, args.fix_yellow, args.experimental)
                 for mod_name, script_path in all_files
             ]
 
@@ -449,6 +457,7 @@ def main():
                             backup=args.backup,
                             fix_debug=args.fix_debug,
                             fix_yellow=args.fix_yellow,
+                            experimental=args.experimental,
                         )
                         if modified:
                             files_modified += 1
@@ -484,7 +493,7 @@ def main():
         print(f"Files skipped (timeout/error): {files_skipped}")
     if parse_errors > 0:
         print(f"Files with parse errors: {parse_errors}")
-    if (args.fix or args.fix_debug or args.fix_yellow) :
+    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental):
         print(f"Files modified: {files_modified}")
         print(f"Total edits applied: {total_edits}")
 
@@ -504,7 +513,9 @@ def main():
         print("Tip: Run with --fix-yellow to also apply YELLOW fixes (unsafe)")
     if debug_count > 0 and not args.fix_debug:
         print("Tip: Run with --fix-debug to comment out DEBUG statements")
-    if (args.fix or args.fix_debug or args.fix_yellow) :
+    if yellow_count > 0 and not args.experimental:
+        print("Tip: Run with --experimental to fix string concat in loops (experimental)")
+    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental):
         print("Tip: Run with --revert to undo all changes using .bak files")
 
 

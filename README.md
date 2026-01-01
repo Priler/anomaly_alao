@@ -12,6 +12,7 @@ python stalker_lua_lint.py [path_to_mods] [options]
 --fix - Fix safe (GREEN) issues automatically
 --fix-yellow - Fix unsafe (YELLOW) issues automatically
 --fix-debug - Comment out debug statements (log, printf, print, etc.)
+--experimental - Enable experimental fixes (string concat in loops)
 
 # Reports & Restore
 --report [file] - Generate comprehensive report (.txt, .html, .json)
@@ -51,8 +52,8 @@ python stalker_lua_lint.py [path_to_mods] [options]
 - Uncached globals used 3+ times
 - Repeated `db.actor`, `time_global()`, `alife()` calls
 
-### YELLOW (unsafe to auto-fix)
-- String concatenation in loops (`s = s .. x`)
+### YELLOW (review needed)
+- String concatenation in loops (`s = s .. x`) - fixable with `--experimental`
 - Repeated `level.object_by_id()` with same argument
 
 ### RED (info only, no auto-fix)
@@ -60,6 +61,33 @@ python stalker_lua_lint.py [path_to_mods] [options]
 
 ### DEBUG (can be auto commented out)
 - `print()`, `printf()`, `log()` calls
+
+## Experimental: String Concat Fix
+
+The `--experimental` flag enables automatic transformation of string concatenation in loops:
+
+**Before:**
+```lua
+local result = ""
+for i = 1, 10 do
+    result = result .. get_line(i)
+end
+```
+
+**After:**
+```lua
+local _result_parts = {}
+for i = 1, 10 do
+    _result_parts[#_result_parts+1] = get_line(i)
+end
+local result = table.concat(_result_parts)
+```
+
+This optimization reduces GC pressure from O(n²) to O(n) for string building.
+
+**Safety:** Only applied when:
+- Variable is initialized to `""` before the loop
+- Pattern is a simple `var = var .. expr`
 
 ## Safety measures
 

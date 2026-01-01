@@ -32,13 +32,15 @@ class ASTTransformer:
         self.analyzer: Optional[ASTAnalyzer] = None
 
     def transform_file(self, file_path: Path, backup: bool = True, dry_run: bool = False,
-                       fix_debug: bool = False, fix_yellow: bool = False) -> Tuple[bool, str, int]:
+                       fix_debug: bool = False, fix_yellow: bool = False,
+                       experimental: bool = False) -> Tuple[bool, str, int]:
         """
         Transform a file based on findings.
         Returns (was_modified, new_content, edit_count).
         """
         self.file_path = file_path
         self.edits = []
+        self.experimental = experimental
 
         # run analyzer
         self.analyzer = ASTAnalyzer()
@@ -55,6 +57,13 @@ class ASTTransformer:
             allowed_severities.add('DEBUG')
 
         fixable = [f for f in findings if f.severity in allowed_severities]
+        
+        # add experimental fixes (string_concat_in_loop) if enabled
+        if experimental:
+            experimental_fixes = [f for f in findings 
+                                  if f.pattern_name == 'string_concat_in_loop' 
+                                  and f.severity == 'YELLOW']
+            fixable.extend(experimental_fixes)
 
         if not fixable:
             return False, self.source, 0
@@ -100,6 +109,9 @@ class ASTTransformer:
             self._edit_debug_statement(finding)
         elif pattern == 'uncached_globals_summary':
             self._edit_uncached_globals(finding)
+        elif pattern == 'string_concat_in_loop':
+            if getattr(self, 'experimental', False):
+                self._edit_string_concat_in_loop(finding)
         elif pattern.startswith('repeated_'):
             self._edit_repeated_calls(finding)
 
@@ -363,6 +375,121 @@ class ASTTransformer:
             priority=200,
         ))
 
+    def _edit_string_concat_in_loop(self, finding: Finding):
+        """
+        Transform string concatenation in loops to table.concat pattern.
+        
+        Before:
+            local result = ""
+            for i = 1, 10 do
+                result = result .. get_part(i)
+            end
+            
+        After:
+            local _result_parts = {}
+            for i = 1, 10 do
+                _result_parts[#_result_parts+1] = get_part(i)
+            end
+            local result = table.concat(_result_parts)
+        """
+        details = finding.details
+        var = details.get('variable')
+        init_line = details.get('init_line')
+        loop_start = details.get('loop_start')
+        loop_end = details.get('loop_end')
+        concat_lines = details.get('concat_lines', [])
+        is_safe = details.get('is_safe', False)
+        
+        if not var or not init_line or not loop_end or not concat_lines:
+            return
+        
+        if not is_safe:
+            return  # only transform safe patterns
+        
+        # skip one-liner loops (loop start == loop end)
+        if loop_start == loop_end:
+            return  # one-liner loop, too complex to transform safely
+        
+        # skip if any concat is on same line as loop start (embedded in for header)
+        for concat_line in concat_lines:
+            if concat_line == loop_start:
+                return  # concat embedded in loop header, skip
+        
+        parts_var = f'_{var}_parts'
+        
+        # VALIDATION PHASE: check all lines can be transformed before making any edits
+        
+        # validate init line
+        init_start, init_end = self._get_line_span(init_line)
+        if init_start is None:
+            return
+        
+        init_text = self.source[init_start:init_end]
+        indent = self._get_indent_at_line(init_line)
+        
+        # validate all concat lines match the expected pattern
+        concat_replacements = []
+        for concat_line in concat_lines:
+            line_start, line_end = self._get_line_span(concat_line)
+            if line_start is None:
+                return  # can't find line, abort
+            
+            line_text = self.source[line_start:line_end]
+            line_indent = self._get_indent_at_line(concat_line)
+            
+            # pattern: var = var .. expr (must be the whole line content, not embedded)
+            concat_pattern = re.compile(
+                rf'^(\s*){re.escape(var)}\s*=\s*{re.escape(var)}\s*\.\.\s*(.+)$',
+                re.DOTALL
+            )
+            match = concat_pattern.match(line_text.rstrip('\n\r'))
+            if not match:
+                return  # pattern not on its own line, abort entire transformation
+            
+            expr = match.group(2).rstrip()
+            new_line = f'{line_indent}{parts_var}[#{parts_var}+1] = {expr}\n'
+            concat_replacements.append((line_start, line_end, new_line))
+        
+        # validate loop end line
+        end_line_end = self._get_line_end(loop_end)
+        if end_line_end is None:
+            return
+        
+        # EDIT PHASE: all validations passed, now add edits
+        
+        # step 1: replace initialization line
+        stripped = init_text.strip()
+        if stripped.startswith('local '):
+            new_init = f'{indent}local {parts_var} = {{}}\n'
+        else:
+            new_init = f'{indent}{parts_var} = {{}}\n'
+        
+        self.edits.append(SourceEdit(
+            start_char=init_start,
+            end_char=init_end,
+            replacement=new_init,
+            priority=50,
+        ))
+        
+        # step 2: replace each concat line
+        for line_start, line_end, new_line in concat_replacements:
+            self.edits.append(SourceEdit(
+                start_char=line_start,
+                end_char=line_end,
+                replacement=new_line,
+                priority=50,
+            ))
+        
+        # step 3: add table.concat after loop ends
+        concat_decl = f'\n{indent}local {var} = table.concat({parts_var})'
+        
+        self.edits.append(SourceEdit(
+            start_char=end_line_end,
+            end_char=end_line_end,
+            replacement=concat_decl,
+            priority=50,
+        ))
+
     def _edit_uncached_globals(self, finding: Finding):
         """Add local caching for globals at function start."""
         details = finding.details
@@ -509,11 +636,13 @@ class ASTTransformer:
 
             indent = self._get_indent_at_line(first_call.line)
 
-            # check if first call is inside a table constructor
-            # look for unbalanced { in lines before this one within scope
+            # check if first call is inside a table constructor or function call arguments
+            # look for unbalanced { or ( in lines before this one within scope
             if scope and hasattr(scope, 'start_line'):
                 brace_depth = 0
+                paren_depth = 0
                 has_loop_before_first_call = False
+                has_branch_between_calls = False
 
                 for check_line in range(scope.start_line, first_call.line + 1):
                     ls, le = self._get_line_span(check_line)
@@ -522,7 +651,22 @@ class ASTTransformer:
                         # skip comments
                         if '--' in line_text:
                             line_text = line_text[:line_text.find('--')]
-                        brace_depth += line_text.count('{') - line_text.count('}')
+                        # skip strings (simple approach - just count outside quotes)
+                        in_string = False
+                        clean_line = ""
+                        i = 0
+                        while i < len(line_text):
+                            c = line_text[i]
+                            if c in ('"', "'") and not in_string:
+                                in_string = c
+                            elif c == in_string and (i == 0 or line_text[i-1] != '\\'):
+                                in_string = False
+                            elif not in_string:
+                                clean_line += c
+                            i += 1
+                        
+                        brace_depth += clean_line.count('{') - clean_line.count('}')
+                        paren_depth += clean_line.count('(') - clean_line.count(')')
 
                         # check for loop constructs before first call
                         if check_line < first_call.line:
@@ -532,16 +676,50 @@ class ASTTransformer:
 
                 if brace_depth > 0:
                     return  # inside table constructor, skip optimization
+                
+                if paren_depth > 0:
+                    return  # inside function call arguments, skip optimization
 
-                # if calls span multiple lines and first call is inside a loop,
-                # insert at function body start instead to avoid scope issues
+                # check if calls span different if/else branches
+                # look for else/elseif between first and last call
                 last_call = calls[-1]
-                if has_loop_before_first_call and last_call.line > first_call.line:
+                if last_call.line > first_call.line:
+                    first_indent = self._get_indent_at_line(first_call.line)
+                    first_indent_len = len(first_indent) if first_indent else 0
+                    
+                    for check_line in range(first_call.line + 1, last_call.line + 1):
+                        cls, cle = self._get_line_span(check_line)
+                        if cls is not None:
+                            check_text = self.source[cls:cle]
+                            check_stripped = check_text.lstrip()
+                            check_indent_len = len(check_text) - len(check_stripped)
+                            
+                            # if else/elseif at same or shallower indent, calls are in different branches
+                            if check_indent_len <= first_indent_len:
+                                first_word = check_stripped.split()[0] if check_stripped.split() else ''
+                                if first_word in ('else', 'elseif'):
+                                    has_branch_between_calls = True
+                                    break
+
+                # if calls span multiple lines and first call is inside a loop OR different branches,
+                # insert at function body start instead to avoid scope issues
+                if (has_loop_before_first_call or has_branch_between_calls) and last_call.line > first_call.line:
                     # insert right after function declaration
                     insert_pos = self._get_line_start(scope.start_line + 1)
                     if insert_pos is None:
                         return
-                    indent = self._get_indent_at_line(scope.start_line + 1)
+                    # use indent from first call (which is inside the function body)
+                    # but reduced by one level since first_call may be inside if/for
+                    call_indent = self._get_indent_at_line(first_call.line)
+                    if call_indent and len(call_indent) > 0:
+                        # detect indent char (tab or spaces)
+                        if call_indent[0] == '\t':
+                            indent = '\t'  # one tab for function body
+                        else:
+                            # count spaces per indent level (usually 4 or 2)
+                            indent = call_indent[:len(call_indent)//2] if len(call_indent) >= 2 else call_indent
+                    else:
+                        indent = '\t'
 
             self.edits.append(SourceEdit(
                 start_char=insert_pos,
@@ -854,7 +1032,8 @@ class ASTTransformer:
 
 
 def transform_file(file_path: Path, backup: bool = True, dry_run: bool = False,
-                   fix_debug: bool = False, fix_yellow: bool = False) -> Tuple[bool, str, int]:
+                   fix_debug: bool = False, fix_yellow: bool = False,
+                   experimental: bool = False) -> Tuple[bool, str, int]:
     """Convenience function to transform a file. Returns (modified, content, edit_count)."""
     transformer = ASTTransformer()
-    return transformer.transform_file(file_path, backup, dry_run, fix_debug, fix_yellow)
+    return transformer.transform_file(file_path, backup, dry_run, fix_debug, fix_yellow, experimental)
