@@ -1,0 +1,1057 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}ALAO Analysis Report{% endblock %}</title>
+    <style>
+        {% block styles %}
+        
+        /* [ Variables ]-- */
+        :root {
+            /* github dark theme */
+            --bg-primary: #0D1117;
+            --bg-secondary: #161b22;
+            --bg-card: #21262d;
+            --bg-sidebar: #161b22;
+            --bg-code: #0d1117;
+            --text-primary: #F0F6FC;
+            --text-secondary: #8b949e;
+            --text-muted: #6e7681;
+            --accent-cyan: #58a6ff;
+            --accent-red: #f85149;
+            --accent-yellow: #d29922;
+            --green: #3fb950;
+            --yellow: #d29922;
+            --red: #f85149;
+            --blue: #58a6ff;
+            --border-color: #30363d;
+            --sidebar-width: 350px;
+            --font-heading: "Trebuchet MS", Arial, Helvetica, sans-serif;
+            --font-main: "Trebuchet MS", Arial, Helvetica, sans-serif;
+            --font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+        }
+
+        /* [ Reset & Base ]-- */
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: var(--font-main);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        /* [ Layout with Sidebar ]-- */
+        .layout {
+            display: flex;
+            min-height: 100vh;
+            margin: 0 auto;
+            max-width: 75vw;
+        }
+
+        .sidebar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: var(--sidebar-width);
+            height: 100vh;
+            background: var(--bg-sidebar);
+            border-right: 1px solid var(--border-color);
+            padding: 20px;
+            overflow-y: auto;
+            z-index: 100;
+            transition: transform 0.3s ease;
+        }
+
+        .sidebar-header {
+            color: var(--accent-cyan);
+            font-family: var(--font-heading);
+            font-size: 1.4rem;
+            letter-spacing: 1px;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .main-content {
+            flex: 1;
+            margin-left: var(--sidebar-width);
+            padding: 20px;
+            max-width: calc(100% - var(--sidebar-width));
+        }
+
+        /* [ Sidebar Toggle (mobile) ]-- */
+        .sidebar-toggle {
+            display: none;
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            z-index: 200;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 8px 12px;
+            cursor: pointer;
+            font-size: 1.2rem;
+        }
+
+        /* [ Filter Section ]-- */
+        .filter-section {
+            margin-bottom: 25px;
+        }
+
+        .filter-section h3 {
+            color: var(--text-secondary);
+            font-family: var(--font-main);
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 12px;
+            font-weight: 600;
+        }
+
+        .filter-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .filter-btn {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 12px;
+            background: transparent;
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font-family: var(--font-main);
+            font-size: 0.9rem;
+        }
+
+        .filter-btn:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .filter-btn.active {
+            border-color: var(--accent-cyan);
+            background: rgba(0, 217, 255, 0.1);
+        }
+
+        .filter-btn .icon {
+            font-size: 1rem;
+        }
+
+        .filter-btn .count {
+            margin-left: auto;
+            background: rgba(255, 255, 255, 0.1);
+            padding: 2px 8px;
+            font-size: 0.8rem;
+        }
+
+        .filter-btn.green { border-left: 3px solid var(--green); }
+        .filter-btn.yellow { border-left: 3px solid var(--yellow); }
+        .filter-btn.red { border-left: 3px solid var(--red); }
+        .filter-btn.debug { border-left: 3px solid var(--blue); }
+
+        .filter-btn.green.active { background: rgba(63, 185, 80, 0.15); border-color: var(--green); }
+        .filter-btn.yellow.active { background: rgba(210, 153, 34, 0.15); border-color: var(--yellow); }
+        .filter-btn.red.active { background: rgba(248, 81, 73, 0.15); border-color: var(--red); }
+        .filter-btn.debug.active { background: rgba(88, 166, 255, 0.15); border-color: var(--blue); }
+
+        /* impact filter buttons */
+        .filter-btn.impact-critical { border-left: 3px solid #ff4444; }
+        .filter-btn.impact-high { border-left: 3px solid #ff8800; }
+        .filter-btn.impact-medium { border-left: 3px solid #ffcc00; }
+        .filter-btn.impact-low { border-left: 3px solid #888888; }
+
+        .filter-btn.impact-critical.active { background: rgba(255, 68, 68, 0.15); border-color: #ff4444; }
+        .filter-btn.impact-high.active { background: rgba(255, 136, 0, 0.15); border-color: #ff8800; }
+        .filter-btn.impact-medium.active { background: rgba(255, 204, 0, 0.15); border-color: #ffcc00; }
+        .filter-btn.impact-low.active { background: rgba(136, 136, 136, 0.15); border-color: #888888; }
+
+        /* pattern filter checkboxes */
+        .pattern-filter-group {
+            max-height: 200px;
+            overflow-y: auto;
+            padding-right: 5px;
+        }
+
+        .pattern-checkbox {
+            display: flex;
+            align-items: center;
+            padding: 6px 8px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            transition: background 0.2s;
+            border-radius: 4px;
+        }
+
+        .pattern-checkbox:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .pattern-checkbox input[type="checkbox"] {
+            margin-right: 8px;
+            accent-color: var(--accent-cyan);
+        }
+
+        .pattern-checkbox .pattern-name {
+            flex: 1;
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+        }
+
+        .pattern-checkbox .pattern-count {
+            color: var(--text-muted);
+            font-size: 0.7rem;
+            margin-left: 5px;
+        }
+
+        /* scrollbar for pattern filter */
+        .pattern-filter-group::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .pattern-filter-group::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        .pattern-filter-group::-webkit-scrollbar-thumb {
+            background: var(--border-color);
+            border-radius: 3px;
+        }
+
+        /* [ Quick Stats in sidebar ]-- */
+        .quick-stats {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 12px;
+            margin-bottom: 20px;
+        }
+
+        .quick-stats .stat-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 0;
+            font-size: 0.85rem;
+        }
+
+        .quick-stats .stat-label {
+            color: var(--text-muted);
+        }
+
+        .quick-stats .stat-value {
+            font-weight: 600;
+        }
+
+        /* [ Search Box ]-- */
+        .search-box {
+            margin-bottom: 20px;
+        }
+
+        .search-input {
+            width: 100%;
+            padding: 10px 12px;
+            background: #F0F6FC;
+            border: 1px solid var(--border-color);
+            color: black;
+            font-family: var(--font-main);
+            font-size: 0.9rem;
+        }
+
+        .search-input::placeholder {
+            color: var(--text-muted);
+        }
+
+        .search-input:focus {
+            outline: none;
+            border-color: var(--accent-cyan);
+        }
+
+        /* [ Typography ]-- */
+        h1 {
+            color: var(--text-primary);
+            font-family: var(--font-heading);
+            font-size: 2.5rem;
+            letter-spacing: 2px;
+            margin-bottom: 0.5rem;
+        }
+
+        h2 {
+            color: var(--text-primary);
+            font-family: var(--font-heading);
+            font-size: 1.5rem;
+            letter-spacing: 1px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 8px;
+            margin-bottom: 15px;
+        }
+
+        h3 {
+            color: var(--accent-yellow);
+            font-family: var(--font-main);
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+
+        a {
+            color: var(--accent-cyan);
+            text-decoration: none;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+        /* [ Header ]-- */
+        .header {
+            margin-bottom: 30px;
+        }
+
+        .header p {
+            color: var(--text-secondary);
+        }
+
+        /* [ Summary Box ]-- */
+        .summary {
+            background: var(--bg-secondary);
+            padding: 20px;
+            margin-bottom: 25px;
+        }
+
+        .summary-stats {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+            margin-top: 15px;
+        }
+
+        .stat {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 1.1rem;
+        }
+
+        .stat-icon {
+            font-size: 1rem;
+        }
+
+        .stat.green { color: var(--green); }
+        .stat.yellow { color: var(--yellow); }
+        .stat.red { color: var(--red); }
+        .stat.debug { color: var(--blue); }
+        .stat.total { color: var(--text-primary); font-weight: 600; }
+
+        /* impact stat colors */
+        .stat.impact-critical { color: #ff4444; }
+        .stat.impact-high { color: #ff8800; }
+        .stat.impact-medium { color: #ffcc00; }
+        .stat.impact-low { color: #888888; }
+
+        /* summary sections */
+        .summary-section {
+            margin-bottom: 15px;
+        }
+
+        .summary-section h4 {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .impact-stats {
+            margin-top: 5px;
+        }
+
+        /* [ Mod Cards ]-- */
+        .mod-card {
+            background: var(--bg-card);
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .mod-card.hidden {
+            display: none;
+        }
+
+        .mod-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .mod-meta {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        /* [ File Sections ]-- */
+        .file-section {
+            margin: 15px 0 15px 15px;
+            padding-left: 15px;
+            border-left: 2px solid var(--border-color);
+        }
+
+        .file-section.hidden {
+            display: none;
+        }
+
+        /* [ Findings ]-- */
+        .finding {
+            font-size: 0.9rem;
+            padding: 12px 15px;
+            margin: 10px 0;
+            border-radius: 6px;
+            background: rgba(0, 0, 0, 0.2);
+        }
+
+        .finding.hidden {
+            display: none;
+        }
+
+        .finding.green {
+            border-left: 3px solid var(--green);
+        }
+
+        .finding.yellow {
+            border-left: 3px solid var(--yellow);
+        }
+
+        .finding.red {
+            border-left: 3px solid var(--red);
+        }
+
+        .finding.debug {
+            border-left: 3px solid var(--blue);
+        }
+
+        .finding-header {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+
+        .line-num {
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            min-width: 45px;
+        }
+
+        .severity-icon {
+            font-size: 0.9rem;
+        }
+
+        .pattern-name {
+            color: var(--accent-cyan);
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+        }
+
+        .finding-description {
+            color: var(--text-secondary);
+            margin-left: 55px;
+            font-size: 0.85rem;
+            margin-bottom: 8px;
+        }
+
+        /* [ Performance Impact ]-- */
+        .finding-impact {
+            margin-left: 55px;
+            font-size: 0.75rem;
+            margin-bottom: 8px;
+            color: var(--text-muted);
+        }
+
+        .finding-impact .impact-level {
+            text-transform: uppercase;
+            font-weight: 600;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.7rem;
+        }
+
+        .impact-critical .impact-level {
+            background: rgba(255, 68, 68, 0.3);
+            color: #ff4444;
+        }
+
+        .impact-high .impact-level {
+            background: rgba(255, 136, 0, 0.2);
+            color: #ff8800;
+        }
+
+        .impact-medium .impact-level {
+            background: rgba(255, 204, 0, 0.2);
+            color: #ffcc00;
+        }
+
+        .impact-low .impact-level {
+            background: rgba(110, 118, 129, 0.2);
+            color: var(--text-muted);
+        }
+
+        /* [ Mod Breakdown ]-- */
+        .mod-breakdown {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            margin-left: 5px;
+        }
+
+        /* [ Issue Severity in Table ]-- */
+        .issue-severity {
+            margin-right: 6px;
+        }
+
+        /* [ Code Snippet ]-- */
+        .code-toggle {
+            color: var(--text-muted);
+            font-size: 0.75rem;
+            cursor: pointer;
+            margin-left: 55px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            user-select: none;
+        }
+
+        .code-toggle:hover {
+            color: var(--accent-cyan);
+        }
+
+        .code-toggle::before {
+            content: '>';
+            font-size: 0.6rem;
+            transition: transform 0.2s;
+        }
+
+        .code-toggle.expanded::before {
+            transform: rotate(90deg);
+        }
+
+        .code-snippet {
+            display: none;
+            margin: 10px 0 0 55px;
+            padding: 10px 12px;
+            background: var(--bg-code);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+            overflow-x: auto;
+            white-space: pre;
+            color: var(--text-secondary);
+        }
+
+        .code-snippet.visible {
+            display: block;
+        }
+
+        .code-snippet .highlight {
+            background: rgba(88, 166, 255, 0.25);
+            color: #58a6ff;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-weight: 600;
+            border-bottom: 2px solid #58a6ff;
+        }
+
+        /* [ Top Issues Table ]-- */
+        .top-issues {
+            margin-top: 20px;
+        }
+
+        .issues-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+
+        .issues-table th,
+        .issues-table td {
+            text-align: left;
+            padding: 10px 15px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .issues-table th {
+            background: var(--bg-primary);
+            color: var(--text-secondary);
+            font-weight: 600;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .issues-table tr:hover {
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .count {
+            font-family: var(--font-mono);
+            color: var(--accent-yellow);
+        }
+
+        /* [ Collapsible ]-- */
+        .collapsible {
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .collapsible::before {
+            content: 'v ';
+            font-size: 0.7rem;
+            color: var(--text-muted);
+        }
+
+        .collapsible.collapsed::before {
+            content: '> ';
+        }
+
+        .collapsible-content {
+            overflow: hidden;
+        }
+
+        .collapsible-content.collapsed {
+            display: none;
+        }
+
+        /* [ No Results Message ]-- */
+        .no-results {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-muted);
+            font-size: 1.1rem;
+        }
+
+        .no-results.hidden {
+            display: none;
+        }
+
+        /* [ Responsive ]-- */
+        @media (max-width: 900px) {
+            .sidebar {
+                transform: translateX(-100%);
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .sidebar-toggle {
+                display: block;
+            }
+
+            .main-content {
+                margin-left: 0;
+                max-width: 100%;
+                padding-top: 60px;
+            }
+        }
+
+        @media (max-width: 600px) {
+            .summary-stats {
+                flex-direction: column;
+                gap: 10px;
+            }
+
+            .mod-header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .finding {
+                font-size: 0.8rem;
+            }
+
+            .finding-description,
+            .code-toggle,
+            .code-snippet {
+                margin-left: 0;
+            }
+        }
+
+        /* [ Print ]-- */
+        @media print {
+            .sidebar, .sidebar-toggle {
+                display: none !important;
+            }
+
+            .main-content {
+                margin-left: 0;
+                max-width: 100%;
+            }
+
+            body {
+                background: white;
+                color: black;
+            }
+
+            .mod-card {
+                break-inside: avoid;
+            }
+
+            .code-snippet {
+                display: block !important;
+            }
+        }
+        
+        {% endblock %}
+    </style>
+</head>
+<body>
+    <div class="layout">
+        {% block sidebar %}
+        <button class="sidebar-toggle" onclick="toggleSidebar()">Menu</button>
+        
+        <aside class="sidebar" id="sidebar">
+
+            <img src="https://images.gog-statics.com/fdb7d76818c9b4df983d3b79e07b4f577f9cb0416149ef9d1d203fd2dbd34aac.jpg" style="width: 100%;">
+
+            <div class="search-box">
+                <input type="text" class="search-input" id="searchInput" placeholder="Search mods..." oninput="filterBySearch()">
+            </div>
+            
+            <div class="quick-stats">
+                <div class="stat-row">
+                    <span class="stat-label">Findings shown</span>
+                    <span class="stat-value" id="visibleCount">{{ summary.total }}</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Mods shown</span>
+                    <span class="stat-value" id="visibleMods">{{ findings|length }}</span>
+                </div>
+            </div>
+            
+            <div class="filter-section">
+                <h3>Severity</h3>
+                <div class="filter-group">
+                    <button class="filter-btn green active" data-filter="green" onclick="toggleFilter('green')">
+                        <span class="icon">🟢</span>
+                        <span>GREEN</span>
+                        <span class="count">{{ summary.green }}</span>
+                    </button>
+                    <button class="filter-btn yellow active" data-filter="yellow" onclick="toggleFilter('yellow')">
+                        <span class="icon">🟡</span>
+                        <span>YELLOW</span>
+                        <span class="count">{{ summary.yellow }}</span>
+                    </button>
+                    <button class="filter-btn red" data-filter="red" onclick="toggleFilter('red')">
+                        <span class="icon">🔴</span>
+                        <span>RED</span>
+                        <span class="count">{{ summary.red }}</span>
+                    </button>
+                    <button class="filter-btn debug active" data-filter="debug" onclick="toggleFilter('debug')">
+                        <span class="icon">🔵</span>
+                        <span>DEBUG</span>
+                        <span class="count">{{ summary.debug }}</span>
+                    </button>
+                </div>
+            </div>
+            
+            <div class="filter-section">
+                <h3>Impact Level</h3>
+                <div class="filter-group">
+                    <button class="filter-btn impact-critical active" data-impact="critical" onclick="toggleImpact('critical')">
+                        <span>CRITICAL</span>
+                        <span class="count">{{ impact.critical }}</span>
+                    </button>
+                    <button class="filter-btn impact-high active" data-impact="high" onclick="toggleImpact('high')">
+                        <span>HIGH</span>
+                        <span class="count">{{ impact.high }}</span>
+                    </button>
+                    <button class="filter-btn impact-medium active" data-impact="medium" onclick="toggleImpact('medium')">
+                        <span>MEDIUM</span>
+                        <span class="count">{{ impact.medium }}</span>
+                    </button>
+                    <button class="filter-btn impact-low active" data-impact="low" onclick="toggleImpact('low')">
+                        <span>LOW</span>
+                        <span class="count">{{ impact.low }}</span>
+                    </button>
+                </div>
+            </div>
+            
+            <div class="filter-section">
+                <h3>Pattern Types</h3>
+                <div class="pattern-filter-group">
+                    {% for pattern_name, count in patterns %}
+                    <label class="pattern-checkbox">
+                        <input type="checkbox" checked data-pattern="{{ pattern_name }}" onchange="togglePattern('{{ pattern_name }}')">
+                        <span class="pattern-name">{{ pattern_name }}</span>
+                        <span class="pattern-count">({{ count }})</span>
+                    </label>
+                    {% endfor %}
+                </div>
+            </div>
+            
+            <div class="filter-section">
+                <h3>Actions</h3>
+                <div class="filter-group">
+                    <button class="filter-btn" onclick="expandAll()">
+                        <span>Expand All</span>
+                    </button>
+                    <button class="filter-btn" onclick="collapseAll()">
+                        <span>Collapse All</span>
+                    </button>
+                    <button class="filter-btn" onclick="resetFilters()">
+                        <span>Reset Filters</span>
+                    </button>
+                </div>
+            </div>
+        </aside>
+        {% endblock %}
+        
+        <main class="main-content">
+            {% block content %}{% endblock %}
+        </main>
+    </div>
+
+    {% block scripts %}
+    <script>
+        const filters = {
+            severity: {
+                green: true,
+                yellow: true,
+                red: false,
+                debug: true
+            },
+            impact: {
+                critical: true,
+                high: true,
+                medium: true,
+                low: true
+            },
+            patterns: {},
+            search: ''
+        };
+
+        // apply filters on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            // initialize pattern filters from checkboxes
+            document.querySelectorAll('.pattern-checkbox input[type="checkbox"]').forEach(cb => {
+                filters.patterns[cb.dataset.pattern] = cb.checked;
+            });
+            applyFilters();
+        });
+
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('open');
+        }
+
+        function toggleFilter(severity) {
+            filters.severity[severity] = !filters.severity[severity];
+            const btn = document.querySelector(`[data-filter="${severity}"]`);
+            btn.classList.toggle('active', filters.severity[severity]);
+            applyFilters();
+        }
+
+        function toggleImpact(level) {
+            filters.impact[level] = !filters.impact[level];
+            const btn = document.querySelector(`[data-impact="${level}"]`);
+            btn.classList.toggle('active', filters.impact[level]);
+            applyFilters();
+        }
+
+        function togglePattern(pattern) {
+            const cb = document.querySelector(`input[data-pattern="${pattern}"]`);
+            filters.patterns[pattern] = cb.checked;
+            applyFilters();
+        }
+
+        function filterBySearch() {
+            filters.search = document.getElementById('searchInput').value.toLowerCase();
+            applyFilters();
+        }
+
+        function applyFilters() {
+            let visibleFindings = 0;
+            let visibleMods = 0;
+            
+            // track impact counts for visible findings
+            const visibleImpacts = { critical: 0, high: 0, medium: 0, low: 0 };
+            
+            document.querySelectorAll('.mod-card').forEach(mod => {
+                const modName = mod.querySelector('h2').textContent.toLowerCase();
+                const matchesSearch = !filters.search || modName.includes(filters.search);
+                
+                let modHasVisibleFindings = false;
+                
+                mod.querySelectorAll('.file-section').forEach(fileSection => {
+                    let fileHasVisibleFindings = false;
+                    
+                    fileSection.querySelectorAll('.finding').forEach(finding => {
+                        const severity = finding.dataset.severity || 'red';
+                        const impact = finding.dataset.impact || 'low';
+                        const pattern = finding.dataset.pattern || '';
+                        
+                        const severityOk = filters.severity[severity];
+                        const impactOk = filters.impact[impact];
+                        const patternOk = filters.patterns[pattern] !== false;
+                        
+                        const isVisible = severityOk && impactOk && patternOk && matchesSearch;
+                        finding.classList.toggle('hidden', !isVisible);
+                        
+                        if (isVisible) {
+                            visibleFindings++;
+                            fileHasVisibleFindings = true;
+                            modHasVisibleFindings = true;
+                            
+                            // track impact
+                            if (impact in visibleImpacts) {
+                                visibleImpacts[impact]++;
+                            }
+                        }
+                    });
+                    
+                    fileSection.classList.toggle('hidden', !fileHasVisibleFindings);
+                });
+                
+                mod.classList.toggle('hidden', !modHasVisibleFindings);
+                if (modHasVisibleFindings) visibleMods++;
+            });
+            
+            // update sidebar stats
+            document.getElementById('visibleCount').textContent = visibleFindings;
+            document.getElementById('visibleMods').textContent = visibleMods;
+            
+            // update summary impact stats
+            updateSummaryImpactStats(visibleImpacts);
+            
+            const noResults = document.getElementById('noResults');
+            if (noResults) {
+                noResults.classList.toggle('hidden', visibleMods > 0);
+            }
+        }
+        
+        function updateSummaryImpactStats(impacts) {
+            // update the summary section's impact stats
+            const criticalEl = document.getElementById('summaryImpactCritical');
+            const highEl = document.getElementById('summaryImpactHigh');
+            const mediumEl = document.getElementById('summaryImpactMedium');
+            const lowEl = document.getElementById('summaryImpactLow');
+            
+            if (criticalEl) criticalEl.textContent = 'CRITICAL: ' + impacts.critical;
+            if (highEl) highEl.textContent = 'HIGH: ' + impacts.high;
+            if (mediumEl) mediumEl.textContent = 'MEDIUM: ' + impacts.medium;
+            if (lowEl) lowEl.textContent = 'LOW: ' + impacts.low;
+        }
+
+        function resetFilters() {
+            // reset severity
+            ['green', 'yellow', 'debug'].forEach(s => {
+                filters.severity[s] = true;
+                document.querySelector(`[data-filter="${s}"]`)?.classList.add('active');
+            });
+            filters.severity.red = false;
+            document.querySelector('[data-filter="red"]')?.classList.remove('active');
+            
+            // reset impact
+            ['critical', 'high', 'medium', 'low'].forEach(i => {
+                filters.impact[i] = true;
+                document.querySelector(`[data-impact="${i}"]`)?.classList.add('active');
+            });
+            
+            // reset patterns
+            document.querySelectorAll('.pattern-checkbox input[type="checkbox"]').forEach(cb => {
+                cb.checked = true;
+                filters.patterns[cb.dataset.pattern] = true;
+            });
+            
+            // reset search
+            filters.search = '';
+            const searchInput = document.getElementById('searchInput');
+            if (searchInput) searchInput.value = '';
+            
+            applyFilters();
+        }
+
+        function expandAll() {
+            document.querySelectorAll('.collapsible').forEach(el => {
+                el.classList.remove('collapsed');
+                const content = findCollapsibleContent(el);
+                if (content) content.classList.remove('collapsed');
+            });
+        }
+
+        function collapseAll() {
+            document.querySelectorAll('.collapsible').forEach(el => {
+                el.classList.add('collapsed');
+                const content = findCollapsibleContent(el);
+                if (content) content.classList.add('collapsed');
+            });
+        }
+
+        function findCollapsibleContent(trigger) {
+            let content = trigger.nextElementSibling;
+            if (content && content.classList.contains('collapsible-content')) {
+                return content;
+            }
+            
+            const parent = trigger.parentElement;
+            if (parent) {
+                content = parent.nextElementSibling;
+                if (content && content.classList.contains('collapsible-content')) {
+                    return content;
+                }
+            }
+            
+            const container = trigger.closest('.mod-card') || trigger.closest('.file-section');
+            if (container) {
+                content = container.querySelector('.collapsible-content');
+                if (content) return content;
+            }
+            
+            return null;
+        }
+
+        function toggleCode(btn) {
+            btn.classList.toggle('expanded');
+            const snippet = btn.nextElementSibling;
+            if (snippet && snippet.classList.contains('code-snippet')) {
+                snippet.classList.toggle('visible');
+            }
+        }
+
+        // collapsible click handlers
+        document.querySelectorAll('.collapsible').forEach(el => {
+            el.addEventListener('click', (e) => {
+                e.stopPropagation();
+                el.classList.toggle('collapsed');
+                const content = findCollapsibleContent(el);
+                if (content) {
+                    content.classList.toggle('collapsed');
+                }
+            });
+        });
+
+        // close sidebar on mobile when clicking outside
+        document.addEventListener('click', (e) => {
+            const sidebar = document.getElementById('sidebar');
+            const toggle = document.querySelector('.sidebar-toggle');
+            
+            if (window.innerWidth <= 900 && 
+                !sidebar.contains(e.target) && 
+                !toggle.contains(e.target) &&
+                sidebar.classList.contains('open')) {
+                sidebar.classList.remove('open');
+            }
+        });
+    </script>
+    {% endblock %}
+</body>
+</html>

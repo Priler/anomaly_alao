@@ -1,0 +1,85 @@
+# ALAO - Anomaly Lua Auto Optimizer
+
+AST-based Lua analyzer and optimizer for Anomaly mods.
+Experimental.
+
+## Quick Start
+
+```bash
+python stalker_lua_lint.py [path_to_mods] [options]
+
+# Basic Usage (combinable)
+--fix - Fix safe (GREEN) issues automatically
+--fix-yellow - Fix unsafe (YELLOW) issues automatically
+--fix-debug - Comment out debug statements (log, printf, print, etc.)
+
+# Reports & Restore
+--report [file] - Generate comprehensive report (.txt, .html, .json)
+--revert - Restore all .bak backup files (undo fixes)
+
+# Performance
+--timeout [seconds] - Timeout per file (default: 10)
+--workers / -j - Parallel workers for fixes (default: CPU count)
+
+# Output
+--verbose / -v - Show detailed output
+--quiet / -q - Only show summary
+
+# Backup Management
+--backup / --no-backup - Create .bak files before modifying (default: True)
+--list-backups - List all .bak backup files
+--clean-backups - Remove all .bak backup files
+```
+
+
+## Requires
+
+```
+- Python 3.8+
+- luaparser
+- jinja2
+```
+
+## Currently Detected Patterns
+
+### GREEN (safe to auto-fix)
+- `table.insert(t, v)` → `t[#t+1] = v`
+- `table.getn(t)` → `#t`
+- `string.len(s)` → `#s`
+- `math.pow(x, 2)` → `x*x`
+- `math.pow(x, 0.5)` → `math.sqrt(x)`
+- Uncached globals used 3+ times
+- Repeated `db.actor`, `time_global()`, `alife()` calls
+
+### YELLOW (unsafe to auto-fix)
+- String concatenation in loops (`s = s .. x`)
+- Repeated `level.object_by_id()` with same argument
+
+### RED (info only, no auto-fix)
+- Global variable writes
+
+### DEBUG (can be auto commented out)
+- `print()`, `printf()`, `log()` calls
+
+## Safety measures
+
+To prevent loosing original scripts, make sure to backup them.
+However, as an additional protection level this tool creates `.bak` files before any changes.
+
+```bash
+# List all backups
+python stalker_lua_lint.py /path/to/mods --list-backups
+
+# Restore from backups
+python stalker_lua_lint.py /path/to/mods --revert
+
+# Delete backups (DO NOT USE THIS, no point removing og scripts, better keep them)
+python stalker_lua_lint.py /path/to/mods --clean-backups
+
+# Disable backups (NOT RECOMMENDED)
+python stalker_lua_lint.py /path/to/mods --fix --no-backup
+```
+
+## Author
+
+Abraham (Priler)
