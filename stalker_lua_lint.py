@@ -183,10 +183,48 @@ def main():
 
     args = parser.parse_args()
 
-    # tyr get path interactively if not provided
+    # try get path interactively if not provided
     if args.path:
-        # strip quotes and trailing slashes to avoid path issues
-        clean_path = args.path.strip('"\'').rstrip('/\\')
+        # clean path: strip quotes, trailing slashes, and fix common issues
+        clean_path = args.path
+        # detect if arguments got concatenated due to Windows \" escape issue
+        if ' --' in clean_path:
+            print("WARNING: Detected malformed input - likely caused by trailing backslash before quote.")
+            print("         Windows interprets \\\" as an escaped quote, breaking argument parsing.")
+            print("")
+            print("Instead of:  \"C:\\\\path\\\\\" --flags")
+            print("Use:         \"C:\\\\path\" --flags")
+            print("")
+            
+            # try to recover flags
+            parts = clean_path.split(' --')
+            clean_path = parts[0]
+            for part in parts[1:]:
+                flag = part.split()[0] if part.split() else part
+                if flag == 'direct':
+                    args.direct = True
+                    print(f"  Recovered: --direct")
+                elif flag == 'fix':
+                    args.fix = True
+                    print(f"  Recovered: --fix")
+                elif flag == 'fix-yellow':
+                    args.fix_yellow = True
+                    print(f"  Recovered: --fix-yellow")
+                elif flag == 'fix-debug':
+                    args.fix_debug = True
+                    print(f"  Recovered: --fix-debug")
+                elif flag == 'experimental':
+                    args.experimental = True
+                    print(f"  Recovered: --experimental")
+                elif flag.startswith('report'):
+                    # try to get report filename
+                    remaining = part[6:].strip()  # after "report"
+                    if remaining:
+                        args.report = remaining.split()[0].strip('"\'')
+                        print(f"  Recovered: --report {args.report}")
+            print("")
+            
+        clean_path = clean_path.strip('"\'').rstrip('/\\')
         mods_path = Path(clean_path)
     else:
         print("Anomaly Lua Auto Optimizer (ALAO)")
