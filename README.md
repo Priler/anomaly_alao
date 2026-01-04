@@ -14,6 +14,7 @@ python stalker_lua_lint.py [path_to_mods] [options]
 --fix-debug - Comment out debug statements (log, printf, print, etc.)
 --experimental - Enable experimental fixes (string concat in loops)
 --direct - Process scripts directly (searches for .script files recursively in the path or you can provide single .script path)
+--exclude "alao_exclude.txt" -- Allows to exclude certain mods from reports/fixes (you can specify any other custom .txt list)
 
 # Reports & Restore
 --report [file] - Generate comprehensive report (.txt, .html, .json)
