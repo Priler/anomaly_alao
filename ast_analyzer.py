@@ -23,6 +23,8 @@ from typing import List, Dict, Set, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections import defaultdict
+import sys
+import io
 
 from models import Finding
 
@@ -189,7 +191,13 @@ class ASTAnalyzer:
         self.source_lines = self.source.splitlines()
 
         try:
-            tree = ast.parse(self.source)
+            # suppress ANTLR lexer error output during parse
+            old_stderr = sys.stderr
+            sys.stderr = io.StringIO()
+            try:
+                tree = ast.parse(self.source)
+            finally:
+                sys.stderr = old_stderr
         except Exception:
             # parse error, skip
             return []
