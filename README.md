@@ -23,7 +23,7 @@ The auto-fixed _(by ALAO)_ function has a complexity of **O(n)**.
 For huge data _(say, 100k iterations)_, it works approximately 150x faster.  
 It also prevents unnecessary memory allocations, further reducing GC pressure.
 
-Another simple example ALAO handles is the usage of `math.pow(v, 2)`.  
+Another example ALAO handles is the usage of `math.pow(v, 2)`.  
 We can replace the function call with a single MUL bytecode instruction `v*v`.   
 The same pattern applies to  `math.pow(v, 3)` and `math.pow(v, 0.5)`.
 
@@ -118,12 +118,30 @@ This optimization reduces GC pressure from O(n²) to O(n) for string building.
 - Variable is initialized to `""` before the loop
 - Pattern is a simple `var = var .. expr`
 
+## Nil checks performance impact
+Honestly, there are little to none performance impact even for thousands of `nil` guard checks.  
+In terms of bytecode, it compiles to:  
+`TEST` - checks if the value is truthy  
+`JMP` - conditional jump
+
+It'll take like ~2-5 CPU nanoseconds per check and zero memory usage.  
+So feel free to apply that, as it prevents most of the CTDs caused by evil `nil`.
+
 ## Safety measures
 
-To prevent loosing original scripts, make sure to backup them.
-However, as an additional protection level this tool creates `.bak` files before any changes.
+In order to prevent loosing original scripts, make sure to backup them before applying the fixes.  
+However, as an additional protection level this tool creates `.bak` files before any changes.  
+
+You can also use `--backup-all-scripts` flag to make the backup of all your .script files inside your mods _(keeping the folder structure, of course)_.  
+In this case there's no need to manually backup the mods folder.  
+Because ALAO only touches .script files and all of them will have a full backup now with this option.
 
 ```bash
+# Make a full backup of all .script files in a given path
+# it will create a .zip archive containing all your current scripts
+# archive will be named according to current date (ex. scripts-backup-2026-01-05_09-03-23.zip)
+python stalker_lua_lint.py /path/to/mods --backup-all-scripts
+
 # List all backups
 python stalker_lua_lint.py /path/to/mods --list-backups
 

@@ -18,6 +18,9 @@ Options:
                        Remove 100% safe dead code (unreachable code, if false blocks)
 
     # IMPORTANT
+    --backup-all-scripts [path]
+                       Backup ALL scripts to a zip archive before modifications
+                       (default: scripts-backup-<date>.zip)
     --revert          Restore all .bak backup files (undo fixes)
     --report [file]   Generate a comprehensive report (supports .txt, .html, .json)
 
@@ -41,6 +44,7 @@ import sys
 import os
 import argparse
 import shutil
+import zipfile
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed, BrokenExecutor
@@ -88,6 +92,68 @@ def transform_file_worker(args_tuple):
         return (script_path, modified, edit_count, None)
     except Exception as e:
         return (script_path, False, 0, str(e))
+
+
+def backup_all_scripts(all_files, output_path=None, mods_root=None, quiet=False):
+    """
+    Backup all script files to a zip archive.
+    
+    Args:
+        all_files: List of (mod_name, script_path) tuples
+        output_path: Path to output zip file (auto-generated if None or 'auto')
+        mods_root: Root mods directory (for relative paths in archive)
+        quiet: Suppress output
+    
+    Returns:
+        Path to created zip file, or None on failure
+    """
+    if not all_files:
+        if not quiet:
+            print("No scripts to backup.")
+        return None
+    
+    # generate default filename if needed
+    if output_path is None or output_path == 'auto':
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        output_path = Path(f'scripts-backup-{timestamp}.zip')
+    else:
+        output_path = Path(output_path)
+    
+    # ensure .zip extension
+    if output_path.suffix.lower() != '.zip':
+        output_path = output_path.with_suffix('.zip')
+    
+    if not quiet:
+        print(f"Creating backup: {output_path}")
+        print(f"Backing up {len(all_files)} script files...")
+    
+    try:
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for i, (mod_name, script_path) in enumerate(all_files):
+                # create archive path preserving mod structure
+                if mods_root and script_path.is_relative_to(mods_root):
+                    archive_path = script_path.relative_to(mods_root)
+                else:
+                    # fallback: use mod_name/filename
+                    archive_path = Path(mod_name) / script_path.name
+                
+                zf.write(script_path, archive_path)
+                
+                if not quiet and (i + 1) % 500 == 0:
+                    print(f"  {i + 1}/{len(all_files)} files...")
+        
+        # get file size
+        size_mb = output_path.stat().st_size / (1024 * 1024)
+        
+        if not quiet:
+            print(f"Backup complete: {output_path} ({size_mb:.2f} MB)")
+        
+        return output_path
+    
+    except Exception as e:
+        if not quiet:
+            print(f"Backup failed: {e}")
+        return None
 
 
 def main():
@@ -141,6 +207,15 @@ def main():
         action="store_false",
         dest="backup",
         help="Don't create backup files"
+    )
+    parser.add_argument(
+        "--backup-all-scripts",
+        type=str,
+        nargs='?',
+        const='auto',
+        default=None,
+        metavar="PATH",
+        help="Backup all scripts to a zip archive before any modifications (default name: scripts-backup-<date>.zip)"
     )
     parser.add_argument(
         "--report",
@@ -377,6 +452,18 @@ def main():
     for mod_name, scripts in mods.items():
         for script_path in scripts:
             all_files.append((mod_name, script_path))
+
+    # backup all scripts FIRST if requested (before any modifications)
+    if args.backup_all_scripts:
+        backup_path = backup_all_scripts(
+            all_files,
+            output_path=args.backup_all_scripts,
+            mods_root=mods_path,
+            quiet=args.quiet
+        )
+        if backup_path is None and not args.quiet:
+            print("Warning: Backup failed, continuing anyway...")
+        print()  # blank line after backup
 
     num_workers = args.workers or min(os.cpu_count() or 4, 8)  # cap at 8 by default
     start_time = datetime.now()
