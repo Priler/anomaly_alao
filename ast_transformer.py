@@ -114,11 +114,12 @@ class ASTTransformer:
 
         if not dry_run:
             if backup:
-                backup_path = file_path.with_suffix(file_path.suffix + '.bak')
+                # use .alao-bak extension to distinguish from mod author backups
+                backup_path = file_path.with_suffix(file_path.suffix + '.alao-bak')
                 if not backup_path.exists():
                     shutil.copy2(file_path, backup_path)
 
-            file_path.write_text(new_content, encoding='utf-8')
+            file_path.write_text(new_content, encoding='latin-1')
 
         return True, new_content, edit_count
 
@@ -416,15 +417,20 @@ class ASTTransformer:
         
         Before:
             local obj = level.object_by_id(id)
-            local sec = obj:section()
+            obj:set_visual("stalker")
             
         After:
             local obj = level.object_by_id(id)
             if obj then
-                local sec = obj:section()
+                obj:set_visual("stalker")
             end
             
         Only applies to safe-to-fix cases (immediately after assignment).
+        Only wraps SINGLE lines to avoid corrupting nested control structures.
+        
+        IMPORTANT: Does NOT wrap lines containing 'local' declarations,
+        as that would change variable scope and break code that uses
+        the variable outside the if block.
         """
         details = finding.details
         
@@ -445,6 +451,17 @@ class ASTTransformer:
             return
         
         access_line_text = self.source[access_line_start:access_line_end]
+        stripped_access = access_line_text.strip()
+        
+        # SAFETY CHECK: don't wrap lines with local declarations
+        if stripped_access.startswith('local '):
+            return
+        
+        # SAFETY CHECK: don't wrap control flow statements (if, for, while, etc.)
+        # these have complex nested structures that can get corrupted
+        control_keywords = ('if ', 'if(', 'for ', 'while ', 'repeat', 'function ', 'function(')
+        if any(stripped_access.startswith(kw) for kw in control_keywords):
+            return
         
         # determine indent from the access line
         indent = ''
@@ -454,64 +471,24 @@ class ASTTransformer:
             else:
                 break
         
-        # look ahead to see how many consecutive lines use this variable
-        # we want to wrap all of them in the if block
-        lines_to_wrap = [access_line]
-        current_line = access_line + 1
-        source_lines = self.source.splitlines()
+        # ONLY wrap this single line - don't try to wrap multiple lines
+        # Multi-line wrapping is error-prone with nested structures
+        wrapped_content = stripped_access
         
-        while current_line <= len(source_lines):
-            next_start, next_end = self._get_line_span(current_line)
-            if next_start is None:
-                break
-            next_text = self.source[next_start:next_end].strip()
-            
-            # stop if empty line or line without the variable
-            if not next_text:
-                break
-            
-            # check if this line uses the variable with a method/index call
-            if f'{var_name}:' in next_text or f'{var_name}.' in next_text:
-                lines_to_wrap.append(current_line)
-                current_line += 1
-            else:
-                break
-        
-        # get the full range of lines to wrap
-        first_line_start, _ = self._get_line_span(lines_to_wrap[0])
-        _, last_line_end = self._get_line_span(lines_to_wrap[-1])
-        
-        if first_line_start is None or last_line_end is None:
-            return
-        
-        # extract all lines to wrap
-        wrapped_content = self.source[first_line_start:last_line_end]
-        
-        # remove trailing newline for proper handling
-        had_trailing_newline = wrapped_content.endswith('\n')
-        wrapped_content = wrapped_content.rstrip('\n')
-        
-        # indent each line and wrap with if-then-end
-        wrapped_lines = wrapped_content.split('\n')
-        indented_lines = []
-        for line in wrapped_lines:
-            stripped = line.lstrip()
-            if stripped:
-                indented_lines.append(f'{indent}    {stripped}')
-            else:
-                indented_lines.append('')
-        
+        # build the replacement
         new_content = f'{indent}if {var_name} then\n'
-        new_content += '\n'.join(indented_lines)
-        new_content += f'\n{indent}end'
-        if had_trailing_newline:
+        new_content += f'{indent}    {wrapped_content}\n'
+        new_content += f'{indent}end'
+        
+        # preserve trailing newline if original had one
+        if access_line_text.endswith('\n'):
             new_content += '\n'
         
         self.edits.append(SourceEdit(
-            start_char=first_line_start,
-            end_char=last_line_end,
+            start_char=access_line_start,
+            end_char=access_line_end,
             replacement=new_content,
-            priority=50,  # lower priority - apply after other fixes
+            priority=50,
         ))
 
     def _edit_dead_code(self, finding: Finding):
@@ -1299,7 +1276,8 @@ class ASTTransformer:
 
 def transform_file(file_path: Path, backup: bool = True, dry_run: bool = False,
                    fix_debug: bool = False, fix_yellow: bool = False,
-                   experimental: bool = False) -> Tuple[bool, str, int]:
+                   experimental: bool = False, fix_nil: bool = False,
+                   remove_dead_code: bool = False) -> Tuple[bool, str, int]:
     """Convenience function to transform a file. Returns (modified, content, edit_count)."""
     transformer = ASTTransformer()
-    return transformer.transform_file(file_path, backup, dry_run, fix_debug, fix_yellow, experimental)
+    return transformer.transform_file(file_path, backup, dry_run, fix_debug, fix_yellow, experimental, fix_nil, remove_dead_code)

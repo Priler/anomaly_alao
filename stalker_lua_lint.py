@@ -21,23 +21,32 @@ Options:
     --backup-all-scripts [path]
                        Backup ALL scripts to a zip archive before modifications
                        (default: scripts-backup-<date>.zip)
-    --revert          Restore all .bak backup files (undo fixes)
+    --revert          Restore all .alao-bak backup files (undo ALAO fixes)
     --report [file]   Generate a comprehensive report (supports .txt, .html, .json)
+
+    # SAFETY (auto-backup on first fix run)
+    When any --fix* flag is used and no scripts-backup-*.zip exists in the mods folder,
+    ALAO will automatically create a backup BEFORE making any changes.
+    This ensures you always have a way to restore your original scripts.
+    
+    --no-first-time-auto-backup
+                       Skip automatic backup creation (not recommended)
 
     # MULTITHREAD processing
     --timeout [seconds]
                        Timeout per file in seconds (default: 10)
     --workers / -j    Number of parallel workers for fixes (default: CPU count)
+    --single-thread   Disable multiprocessing (for debugging)
     
     # USELESS things
     --backup / --no-backup
-                       Create .bak files before modifying (default: True)
+                       Create .alao-bak files before modifying (default: True)
     --verbose / -v    Show detailed output
     --quiet / -q      Only show summary
 
     # DANGER ZONE
-    --list-backups    List all .bak backup files without restoring
-    --clean-backups   Remove all .bak backup files
+    --list-backups    List all .alao-bak backup files without restoring
+    --clean-backups   Remove all .alao-bak backup files
 """
 
 import sys
@@ -101,7 +110,7 @@ def backup_all_scripts(all_files, output_path=None, mods_root=None, quiet=False)
     Args:
         all_files: List of (mod_name, script_path) tuples
         output_path: Path to output zip file (auto-generated if None or 'auto')
-        mods_root: Root mods directory (for relative paths in archive)
+        mods_root: Root mods directory (for relative paths in archive and default output location)
         quiet: Suppress output
     
     Returns:
@@ -115,7 +124,12 @@ def backup_all_scripts(all_files, output_path=None, mods_root=None, quiet=False)
     # generate default filename if needed
     if output_path is None or output_path == 'auto':
         timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        output_path = Path(f'scripts-backup-{timestamp}.zip')
+        filename = f'scripts-backup-{timestamp}.zip'
+        # save in mods_root if provided, otherwise current directory
+        if mods_root:
+            output_path = Path(mods_root) / filename
+        else:
+            output_path = Path(filename)
     else:
         output_path = Path(output_path)
     
@@ -200,13 +214,23 @@ def main():
         "--backup",
         action="store_true",
         default=True,
-        help="Create .bak files before modifying (default: True)"
+        help="Create .alao-bak files before modifying (default: True)"
     )
     parser.add_argument(
         "--no-backup",
         action="store_false",
         dest="backup",
         help="Don't create backup files"
+    )
+    parser.add_argument(
+        "--no-first-time-auto-backup",
+        action="store_true",
+        help="Skip automatic zip backup on first fix run (not recommended)"
+    )
+    parser.add_argument(
+        "--single-thread",
+        action="store_true",
+        help="Disable multiprocessing (for debugging)"
     )
     parser.add_argument(
         "--backup-all-scripts",
@@ -248,17 +272,17 @@ def main():
     parser.add_argument(
         "--revert",
         action="store_true",
-        help="Restore all .bak backup files (undo fixes)"
+        help="Restore all .alao-bak backup files (undo ALAO fixes)"
     )
     parser.add_argument(
         "--list-backups",
         action="store_true",
-        help="List all .bak backup files without restoring"
+        help="List all .alao-bak backup files without restoring"
     )
     parser.add_argument(
         "--clean-backups",
         action="store_true",
-        help="Remove all .bak backup files"
+        help="Remove all .alao-bak backup files"
     )
     parser.add_argument(
         "--direct",
@@ -374,12 +398,12 @@ def main():
     else:
         print(f"Found {len(mods)} mods with {total_scripts} script files\n")
 
-    # handle backup operations
+    # handle backup operations (only ALAO-created .alao-bak files)
     if args.list_backups or args.revert or args.clean_backups:
         backup_files = []
         for mod_name, scripts in mods.items():
             for script_path in scripts:
-                bak_path = script_path.with_suffix(script_path.suffix + '.bak')
+                bak_path = script_path.with_suffix(script_path.suffix + '.alao-bak')
                 if bak_path.exists():
                     backup_files.append((script_path, bak_path, mod_name))
 
@@ -453,7 +477,42 @@ def main():
         for script_path in scripts:
             all_files.append((mod_name, script_path))
 
-    # backup all scripts FIRST if requested (before any modifications)
+    # check if any fix flags are set
+    fix_flags_set = (args.fix or args.fix_debug or args.fix_yellow or 
+                     args.experimental or args.fix_nil or args.remove_dead_code)
+    
+    # auto-backup on first fix run (safety mechanism)
+    if fix_flags_set and not args.no_first_time_auto_backup and not args.backup_all_scripts:
+        # look for existing backup zips in mods folder
+        import glob
+        backup_pattern = str(mods_path / "scripts-backup-*.zip")
+        existing_backups = glob.glob(backup_pattern)
+        
+        if not existing_backups:
+            if not args.quiet:
+                print("=" * 60)
+                print("SAFETY: No backup found. Creating automatic backup first...")
+                print("        (use --no-first-time-auto-backup to skip this)")
+                print("=" * 60)
+            
+            backup_path = backup_all_scripts(
+                all_files,
+                output_path='auto',
+                mods_root=mods_path,
+                quiet=args.quiet
+            )
+            if backup_path is None:
+                print("\n[!] WARNING: Auto-backup failed!")
+                print("    For safety, aborting fix operation.")
+                print("    You can:")
+                print("      1. Fix the backup issue and try again")
+                print("      2. Use --no-first-time-auto-backup to skip (not recommended)")
+                print("      3. Manually backup your scripts folder first")
+                return
+            if not args.quiet:
+                print()  # blank line after backup
+
+    # backup all scripts if explicitly requested (before any modifications)
     if args.backup_all_scripts:
         backup_path = backup_all_scripts(
             all_files,
@@ -564,94 +623,116 @@ def main():
     total_edits = 0
 
     if args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code:
-        if True: # yes
-            fix_msg = "Applying fixes"
-            fix_types = []
-            if args.fix:
-                fix_types.append("GREEN")
-            if args.fix_yellow:
-                fix_types.append("YELLOW")
-            if args.fix_debug:
-                fix_types.append("DEBUG")
-            if args.experimental:
-                fix_types.append("EXPERIMENTAL")
-            if args.fix_nil:
-                fix_types.append("NIL-GUARD")
-            if args.remove_dead_code:
-                fix_types.append("DEAD-CODE")
-            print(f"{fix_msg} ({', '.join(fix_types)}) with {num_workers} workers...")
-
-            # prepare work items, skip files that already have .bak (prevent double-fix)
-            work_items = []
-            skipped_has_backup = 0
-            for mod_name, script_path in all_files:
-                bak_path = script_path.with_suffix(script_path.suffix + '.bak')
-                if bak_path.exists():
-                    skipped_has_backup += 1
-                    if args.verbose:
-                        print(f"  [SKIP] {script_path.name} - backup already exists")
+        # safety: auto-backup on first fix run (unless disabled)
+        if not args.no_first_time_auto_backup:
+            # check if any scripts-backup-*.zip exists in mods folder
+            import glob
+            backup_pattern = str(mods_path / "scripts-backup-*.zip")
+            existing_backups = glob.glob(backup_pattern)
+            
+            if not existing_backups:
+                print("\n" + "=" * 60)
+                print("FIRST-TIME SAFETY BACKUP")
+                print("=" * 60)
+                print("No previous backup found. Creating automatic backup...")
+                print("(Use --no-first-time-auto-backup to skip this in future)\n")
+                
+                backup_result = backup_all_scripts(
+                    all_files,
+                    output_path=None,  # auto-generate name
+                    mods_root=mods_path,
+                    quiet=args.quiet
+                )
+                
+                if backup_result:
+                    print(f"\n✓ Backup created: {backup_result}")
+                    print("=" * 60 + "\n")
                 else:
-                    work_items.append(
-                        (script_path, args.backup, args.fix_debug, args.fix_yellow, args.experimental, args.fix_nil, args.remove_dead_code)
-                    )
-            
-            if skipped_has_backup > 0 and not args.quiet:
-                print(f"Skipping {skipped_has_backup} files with existing backups (already processed)")
-                print(f"Tip: Use --revert first if you want to re-process, or --clean-backups to remove old backups\n")
-            
-            if not work_items:
-                if not args.quiet:
-                    print("No files to process (all have existing backups).")
+                    print("\n✗ Backup failed! Aborting fixes for safety.")
+                    print("  Run with --no-first-time-auto-backup to skip (not recommended)")
+                    sys.exit(1)
             else:
-                completed = 0
-                pool_crashed = False
-                processed_paths = set()
+                if args.verbose:
+                    print(f"Found existing backup: {existing_backups[0]}")
+        
+        # proceed with fixes
+        fix_msg = "Applying fixes"
+        fix_types = []
+        if args.fix:
+            fix_types.append("GREEN")
+        if args.fix_yellow:
+            fix_types.append("YELLOW")
+        if args.fix_debug:
+            fix_types.append("DEBUG")
+        if args.experimental:
+            fix_types.append("EXPERIMENTAL")
+        if args.fix_nil:
+            fix_types.append("NIL-GUARD")
+        if args.remove_dead_code:
+            fix_types.append("DEAD-CODE")
+        print(f"{fix_msg} ({', '.join(fix_types)}) with {num_workers} workers...")
 
+        # prepare work items, skip files that already have .alao-bak (prevent double-fix)
+        work_items = []
+        skipped_has_backup = 0
+        for mod_name, script_path in all_files:
+            bak_path = script_path.with_suffix(script_path.suffix + '.alao-bak')
+            if bak_path.exists():
+                skipped_has_backup += 1
+                if args.verbose:
+                    print(f"  [SKIP] {script_path.name} - backup already exists")
+            else:
+                work_items.append(
+                    (script_path, args.backup, args.fix_debug, args.fix_yellow, args.experimental, args.fix_nil, args.remove_dead_code)
+                )
+        
+        if skipped_has_backup > 0 and not args.quiet:
+            print(f"Skipping {skipped_has_backup} files with existing backups (already processed)")
+            print(f"Tip: Use --revert first if you want to re-process, or --clean-backups to remove old backups\n")
+        
+        if not work_items:
+            if not args.quiet:
+                print("No files to process (all have existing backups).")
+        elif args.single_thread:
+            # single-threaded mode for debugging
+            completed = 0
+            if not args.quiet:
+                print("Running in single-thread mode...")
+            for item in work_items:
+                script_path = item[0]
+                completed += 1
+                if not args.quiet:
+                    progress = completed / len(work_items) * 100
+                    print(f"\r[{progress:5.1f}%] Fixing {completed}/{len(work_items)}...", end="", flush=True)
+                
                 try:
-                    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                        futures = {
-                            executor.submit(
-                                transform_file_worker,
-                                item): item for item in work_items}
+                    script_path, modified, edit_count, error = transform_file_worker(item)
+                    if error:
+                        if args.verbose:
+                            print(f"\n  [FIX ERROR] {script_path.name}: {error}")
+                    elif modified:
+                        files_modified += 1
+                        total_edits += edit_count
+                        if args.verbose:
+                            print(f"\n  [FIXED] {script_path.name} ({edit_count} edits)")
+                except Exception as e:
+                    print(f"\n  [ERROR] {script_path.name}: {e}")
+            
+            if not args.quiet:
+                print()
+        else:
+            completed = 0
+            pool_crashed = False
+            processed_paths = set()
 
-                        for future in as_completed(futures):
-                            completed += 1
-                            if not args.quiet:
-                                progress = completed / len(work_items) * 100
-                                print(
-                                    f"\r[{progress:5.1f}%] Fixing {completed}/{len(work_items)}...", end="", flush=True)
+            try:
+                with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                    futures = {
+                        executor.submit(
+                            transform_file_worker,
+                            item): item for item in work_items}
 
-                            try:
-                                script_path, modified, edit_count, error = future.result()
-                                processed_paths.add(futures[future][0])
-                            except BrokenExecutor:
-                                pool_crashed = True
-                                break
-                            except Exception as e:
-                                if args.verbose:
-                                    print(f"\n  [ERROR] {e}")
-                                continue
-
-                            if error:
-                                if args.verbose:
-                                    print(f"\n  [FIX ERROR] {script_path.name}: {error}")
-                            elif modified:
-                                files_modified += 1
-                                total_edits += edit_count
-                                if args.verbose:
-                                    print(f"\n  [FIXED] {script_path.name} ({edit_count} edits)")
-                except BrokenExecutor:
-                    pool_crashed = True
-
-                if pool_crashed:
-                    if not args.quiet:
-                        print(f"\n\nWorker crashed. Falling back to single-threaded mode...")
-
-                    # process remaining files sequentially
-                    for item in work_items:
-                        if item[0] in processed_paths:
-                            continue
-                        script_path = item[0]
+                    for future in as_completed(futures):
                         completed += 1
                         if not args.quiet:
                             progress = completed / len(work_items) * 100
@@ -659,26 +740,63 @@ def main():
                                 f"\r[{progress:5.1f}%] Fixing {completed}/{len(work_items)}...", end="", flush=True)
 
                         try:
-                            modified, _, edit_count = transform_file(
-                                script_path,
-                                backup=args.backup,
-                                fix_debug=args.fix_debug,
-                                fix_yellow=args.fix_yellow,
-                                experimental=args.experimental,
-                                fix_nil=args.fix_nil,
-                                remove_dead_code=args.remove_dead_code,
-                            )
-                            if modified:
-                                files_modified += 1
-                                total_edits += edit_count
-                                if args.verbose:
-                                    print(f"\n  [FIXED] {script_path.name} ({edit_count} edits)")
+                            script_path, modified, edit_count, error = future.result()
+                            processed_paths.add(futures[future][0])
+                        except BrokenExecutor:
+                            pool_crashed = True
+                            break
                         except Exception as e:
                             if args.verbose:
-                                print(f"\n  [FIX ERROR] {script_path.name}: {e}")
+                                print(f"\n  [ERROR] {e}")
+                            continue
 
+                        if error:
+                            if args.verbose:
+                                print(f"\n  [FIX ERROR] {script_path.name}: {error}")
+                        elif modified:
+                            files_modified += 1
+                            total_edits += edit_count
+                            if args.verbose:
+                                print(f"\n  [FIXED] {script_path.name} ({edit_count} edits)")
+            except BrokenExecutor:
+                pool_crashed = True
+
+            if pool_crashed:
                 if not args.quiet:
-                    print("\r" + " " * 60 + "\r", end="")
+                    print(f"\n\nWorker crashed. Falling back to single-threaded mode...")
+
+                # process remaining files sequentially
+                for item in work_items:
+                    if item[0] in processed_paths:
+                        continue
+                    script_path = item[0]
+                    completed += 1
+                    if not args.quiet:
+                        progress = completed / len(work_items) * 100
+                        print(
+                            f"\r[{progress:5.1f}%] Fixing {completed}/{len(work_items)}...", end="", flush=True)
+
+                    try:
+                        modified, _, edit_count = transform_file(
+                            script_path,
+                            backup=args.backup,
+                            fix_debug=args.fix_debug,
+                            fix_yellow=args.fix_yellow,
+                            experimental=args.experimental,
+                            fix_nil=args.fix_nil,
+                            remove_dead_code=args.remove_dead_code,
+                        )
+                        if modified:
+                            files_modified += 1
+                            total_edits += edit_count
+                            if args.verbose:
+                                print(f"\n  [FIXED] {script_path.name} ({edit_count} edits)")
+                    except Exception as e:
+                        if args.verbose:
+                            print(f"\n  [FIX ERROR] {script_path.name}: {e}")
+
+            if not args.quiet:
+                print("\r" + " " * 60 + "\r", end="")
 
     # output results
     if not args.quiet:
@@ -744,7 +862,7 @@ def main():
     if dead_code_fixable > 0 and not args.remove_dead_code:
         print("Tip: Run with --remove-dead-code to remove safe unreachable code")
     if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code):
-        print("Tip: Run with --revert to undo all changes using .bak files")
+        print("Tip: Run with --revert to undo all changes using .alao-bak files")
 
 
 if __name__ == "__main__":

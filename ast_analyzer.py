@@ -316,7 +316,10 @@ class ASTAnalyzer:
         self._ast_tree = None
 
         try:
-            self.source = file_path.read_text(encoding='utf-8', errors='ignore')
+            # use latin-1 encoding which maps bytes 0-255 directly to unicode 0-255
+            # this preserves non-UTF-8 characters (like Windows-1252 bullet points)
+            # and allows the Lua parser to work correctly
+            self.source = file_path.read_text(encoding='latin-1')
         except Exception:
             return []
 
@@ -1006,6 +1009,8 @@ class ASTAnalyzer:
         2. It's a local variable (not global)
         3. Assignment and access are in the same scope
         4. No complex control flow between them
+        5. Access line is NOT a local declaration (would break scope if wrapped)
+        6. Access line is NOT a control flow statement (if/for/while - too complex)
         """
         # must be immediately after (next line)
         if access_line != nil_source.assign_line + 1:
@@ -1022,6 +1027,19 @@ class ASTAnalyzer:
         # check that the line between is not a control flow statement
         if nil_source.assign_line <= 0 or nil_source.assign_line > len(self.source_lines):
             return False
+        
+        # check access line content
+        if access_line > 0 and access_line <= len(self.source_lines):
+            access_text = self.source_lines[access_line - 1].strip()
+            
+            # CRITICAL: access line must NOT be a local declaration
+            if access_text.startswith('local '):
+                return False
+            
+            # CRITICAL: access line must NOT be control flow (too complex to wrap)
+            control_keywords = ('if ', 'if(', 'for ', 'while ', 'repeat', 'function ', 'function(')
+            if any(access_text.startswith(kw) for kw in control_keywords):
+                return False
             
         return True
 

@@ -120,7 +120,7 @@ This optimization reduces GC pressure from O(n²) to O(n) for string building.
 
 ## Nil checks performance impact
 Honestly, there are little to none performance impact even for thousands of `nil` guard checks.  
-In terms of bytecode, it compiles to:  
+In terms of bytecode, it compiles to _(assuming it's a local variable)_:  
 `TEST` - checks if the value is truthy  
 `JMP` - conditional jump
 
