@@ -465,9 +465,7 @@ def main():
             sys.exit(0)
 
         if args.revert:
-            confirm = input(
-                f"Restore {
-                    len(backup_files)} files from backups? [y/N]: ").strip().lower()
+            confirm = input(f"Restore {len(backup_files)} files from backups? [y/N]: ").strip().lower()
             if confirm != 'y':
                 print("Cancelled.")
                 sys.exit(0)
