@@ -474,13 +474,14 @@ def classify_pcall(
     scopes=None,
 ) -> Dict[str, Any]:
     """Return a details dict for a Finding. `safe` True means GREEN hoist."""
-    line = 0
     details: Dict[str, Any] = {"safe": False}
 
     kind = _call_kind(call)
     if kind is None:
         details["skip_reason"] = "callee is not bare pcall/xpcall"
         return details
+    details["callee"] = kind
+    details["full_match"] = f"{kind}(function"
 
     args = list(getattr(call, "args", None) or [])
     if not args or not isinstance(args[0], AnonymousFunction):
@@ -726,12 +727,19 @@ def analyze_tree(analyzer) -> None:
         if hasattr(analyzer, "_get_source_line"):
             src_line = analyzer._get_source_line(line) or ""
 
+        callee = details.get("callee") or "pcall"
         if details.get("safe"):
-            kind = details.get("rewrite_kind")
-            helper = details.get("helper_name")
+            helper = details.get("helper_name") or "?"
             caps = details.get("captures") or []
-            cap_s = f" captures=[{', '.join(caps)}]" if caps else ""
-            msg = f"pcall anon -> {helper}({', '.join(caps)}) [{kind}]{cap_s}"
+            rewrite = details.get("rewrite_kind")
+            call_args = ", ".join([helper] + list(caps))
+            if rewrite == "assign":
+                msg = f"{callee}(function() x = ... end) -> {callee}({helper}) then x = result"
+                suggestion = f"Hoist to {helper}; assign only on success"
+            else:
+                msg = f"{callee}(function() ... end) -> {callee}({call_args})"
+                suggestion = f"Hoist to {helper}"
+            details["suggestion"] = suggestion
             analyzer.findings.append(Finding(
                 pattern_name="pcall_anon_hoist",
                 severity="GREEN",
@@ -742,11 +750,12 @@ def analyze_tree(analyzer) -> None:
             ))
         else:
             reason = details.get("skip_reason") or "unsafe"
+            details["suggestion"] = f"Skipped: {reason}"
             analyzer.findings.append(Finding(
                 pattern_name="pcall_anon_skip",
                 severity="RED",
                 line_num=line,
-                message=f"pcall anon not hoisted: {reason}",
+                message=f"{callee}(function() ... end) skipped: {reason}",
                 details=details,
                 source_line=src_line,
             ))

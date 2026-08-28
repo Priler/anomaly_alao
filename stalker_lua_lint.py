@@ -1019,6 +1019,10 @@ def main():
                            if f.pattern_name.startswith('dead_code_') and f.details.get('is_safe_to_remove'))
     unused_count = sum(1 for f in reporter.all_findings if f.pattern_name.startswith('unused_'))
 
+    pcall_hoist_count = sum(1 for f in reporter.all_findings if f.pattern_name == 'pcall_anon_hoist')
+    pcall_skip_count = sum(1 for f in reporter.all_findings if f.pattern_name == 'pcall_anon_skip')
+    pcall_count = pcall_hoist_count + pcall_skip_count
+
     findings_str = f"{green_count} GREEN (auto-fixable), {yellow_count} YELLOW (review), {red_count} RED (info)"
     if debug_count > 0:
         findings_str += f", {debug_count} DEBUG (logging)"
@@ -1026,6 +1030,8 @@ def main():
         findings_str += f", {nil_count} NIL ({nil_fixable} fixable)"
     if dead_code_count > 0 or unused_count > 0:
         findings_str += f", {dead_code_count + unused_count} DEAD-CODE ({dead_code_fixable} removable)"
+    if pcall_count > 0:
+        findings_str += f", {pcall_count} PCALL ({pcall_hoist_count} hoistable)"
     print(f"\nFindings: {findings_str}")
 
     if green_count > 0 and not args.fix:
@@ -1040,8 +1046,7 @@ def main():
         print("Tip: Run with --fix-nil to add nil guards for safe nil access patterns")
     if dead_code_fixable > 0 and not args.remove_dead_code:
         print("Tip: Run with --remove-dead-code to remove safe unreachable code")
-    pcall_fixable = sum(1 for f in reporter.all_findings if f.pattern_name == 'pcall_anon_hoist')
-    if pcall_fixable > 0 and not args.fix_pcall:
+    if pcall_hoist_count > 0 and not args.fix_pcall:
         print("Tip: Run with --fix-pcall to hoist pcall(function() ... end) to a named local")
     if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code or args.fix_pcall):
         print("Tip: Run with --revert to undo all changes using .alao-bak files")

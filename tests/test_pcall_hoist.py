@@ -240,6 +240,26 @@ class TestPcallHoist(unittest.TestCase):
         self.assertIn("local function foo_pcall_1()", out)
         self.assertIn("xpcall(foo_pcall_1, print)", out)
 
+    def test_finding_message_matches_alao_style(self):
+        src = (
+            "local function apply(info)\n"
+            "\tpcall(function() info.desc:AdjustHeightToText() end)\n"
+            "end\n"
+        )
+        green = _findings(src, "pcall_anon_hoist")
+        self.assertEqual(len(green), 1)
+        f = green[0]
+        self.assertIn("pcall(function() ... end) -> pcall(apply_pcall_1, info)", f.message)
+        self.assertEqual(f.details.get("full_match"), "pcall(function")
+        self.assertEqual(f.details.get("suggestion"), "Hoist to apply_pcall_1")
+        from reporter import format_details, get_performance_impact
+        shown = format_details(f.details)
+        self.assertNotIn("helper_text", shown)
+        self.assertNotIn("insert_char", shown)
+        self.assertIn("helper_name", shown)
+        self.assertEqual(get_performance_impact("pcall_anon_hoist"), "high")
+        self.assertEqual(get_performance_impact("pcall_anon_skip"), "high")
+
 
 if __name__ == "__main__":
     unittest.main()

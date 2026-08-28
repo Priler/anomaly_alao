@@ -35,6 +35,8 @@ PERFORMANCE_IMPACT = {
     'table_insert_append': 'high',
     'math_pow_simple': 'high',
     'string_format_in_loop': 'high',
+    'pcall_anon_hoist': 'high',
+    'pcall_anon_skip': 'high',
 
     # MEDIUM - low to moderate impact
     'uncached_globals_summary': 'medium',
@@ -99,6 +101,8 @@ def highlight_code_match(line_content: str, details: dict, pattern_name: str) ->
     elif pattern_name == 'uncached_globals_summary':
         # for summary, don't highlight (multi-line examples)
         return escaped
+    elif pattern_name in ('pcall_anon_hoist', 'pcall_anon_skip'):
+        match_text = details.get('full_match') or 'pcall(function'
 
     if match_text:
         escaped_match = html.escape(match_text)
@@ -348,7 +352,12 @@ class Reporter:
             return {}
         
         # skip internal fields that aren't useful in reports
-        skip_keys = {'node', 'nodes', 'ast_node', 'call_node'}
+        skip_keys = {
+            'node', 'nodes', 'ast_node', 'call_node',
+            # pcall hoist internals - used by the transformer, not reports
+            'helper_text', 'insert_char', 'replace_start', 'replace_end',
+            'replace_text', 'safe',
+        }
         
         result = {}
         for key, value in details.items():
@@ -502,8 +511,16 @@ def format_details(details: dict) -> str:
     if not details:
         return ""
 
+    skip_keys = {
+        'node', 'nodes', 'ast_node', 'call_node',
+        'helper_text', 'insert_char', 'replace_start', 'replace_end',
+        'replace_text', 'safe',
+    }
+
     parts = []
     for key, value in details.items():
+        if key in skip_keys:
+            continue
         if key == 'globals' and isinstance(value, dict):
             items = [f"{k}({v}x)" for k, v in value.items()]
             parts.append(f"globals: {', '.join(items)}")
