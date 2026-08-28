@@ -46,6 +46,10 @@ def transform(src: str, fix_pcall: bool = True) -> str:
             dry_run=True,
             fix_pcall=fix_pcall,
         )
+        if fix_pcall:
+            assert "pcallpcall" not in content, content
+            assert "pcalllocal" not in content, content
+            assert "xpcallxpcall" not in content, content
         return content
     finally:
         path.unlink(missing_ok=True)
@@ -66,10 +70,15 @@ class TestPcallHoist(unittest.TestCase):
         )
         out = transform(src)
         self.assertIn("local function foo_pcall_1()", out)
-        self.assertIn("pcall(foo_pcall_1)", out)
+        self.assertIn("\tpcall(foo_pcall_1)", out)
         self.assertNotIn("pcall(function()", out)
         helpers = out.split("local function foo()")[0]
-        self.assertIn("local function foo_pcall_1()", helpers)
+        self.assertEqual(
+            helpers,
+            "local function foo_pcall_1()\n"
+            "\tlevel.enable_input()\n"
+            "end\n\n",
+        )
 
     def test_read_only_capture(self):
         src = (

@@ -77,6 +77,54 @@ def node_span(node) -> Tuple[Optional[int], Optional[int]]:
     return start, end
 
 
+def _pcall_call_span(source: str, call: Call) -> Tuple[Optional[int], Optional[int]]:
+    """Span of `pcall(...)` / `xpcall(...)`, including the callee name.
+
+    luaparser often sets Call.first_token to `(`. Replacing from there and
+    writing `pcall(...)` again yields `pcallpcall(...)`.
+    """
+    start, end = node_span(call)
+    if end is None:
+        return None, None
+
+    func_start, _ = node_span(getattr(call, "func", None))
+    probe = func_start if func_start is not None else start
+    start = _walk_back_to_callee(source, probe) if probe is not None else None
+    if start is None:
+        return None, None
+
+    # last_token is sometimes `end` of the anon; include the call's `)`.
+    i = end
+    while i < len(source) and source[i] in " \t\n":
+        i += 1
+    if i < len(source) and source[i] == ")":
+        end = i + 1
+    elif end > 0 and source[end - 1] != ")":
+        close = source.find(")", end - 1)
+        if close < 0:
+            return None, None
+        end = close + 1
+    return start, end
+
+
+def _walk_back_to_callee(source: str, pos: int) -> Optional[int]:
+    """From `pcall`, `(`, or mid-name, return the start of pcall/xpcall."""
+    i = pos
+    if 0 <= i < len(source) and source[i] == "(":
+        i -= 1
+        while i >= 0 and source[i] in " \t\n":
+            i -= 1
+    while i >= 0 and (source[i].isalnum() or source[i] == "_"):
+        i -= 1
+    start = i + 1
+    j = start
+    while j < len(source) and (source[j].isalnum() or source[j] == "_"):
+        j += 1
+    if source[start:j] in ("pcall", "xpcall"):
+        return start
+    return None
+
+
 def _iter_children(node):
     if node is None:
         return
@@ -494,15 +542,10 @@ def classify_pcall(
 
     anon = args[0]
     fn_start, fn_end = node_span(anon)
-    call_start, call_end = node_span(call)
+    call_start, call_end = _pcall_call_span(source, call)
     if None in (fn_start, fn_end, call_start, call_end):
         details["skip_reason"] = "missing first_token/last_token"
         return details
-
-    # Call first_token is often just '('. Walk back to the callee name.
-    func_start, _ = node_span(call.func)
-    if func_start is not None:
-        call_start = func_start
 
     enclosing = _enclosing_locals(scope)
     use = _analyze_anon(anon, enclosing)
@@ -574,22 +617,12 @@ def classify_pcall(
 
         helper_params = list(orig_params) + leftover
         indent = _line_indent(source, insert_char)
-        body_indent = _line_indent(source, fn_start)
-        if not body_indent:
-            # one step in from the helper indent; default tab if helper is flush
-            inner = indent + "\t" if indent else "\t"
-        else:
-            # keep the original body's indent (already inside the anon)
-            inner = body_indent
-            # if the original was a one-liner `function() x = e end`, body
-            # indent equals the helper line indent; step in one tab
-            if inner == indent or inner == _line_indent(source, call_start):
-                inner = indent + "\t" if indent else "\t"
+        inner = indent + _indent_unit(source)
 
         helper_text = (
             f"{indent}local function {helper_name}({', '.join(helper_params)})\n"
             f"{inner}return {rhs_src}\n"
-            f"{indent}end\n"
+            f"{indent}end\n\n"
         )
 
         call_args = [helper_name]
@@ -652,7 +685,7 @@ def classify_pcall(
     indent = _line_indent(source, insert_char)
     # Header replace keeps the original `function` indent (often deeper than
     # chunk). Re-indent the whole helper to the insert line's indent.
-    helper_text = _reindent_helper(helper_body, indent) + "\n"
+    helper_text = _reindent_helper(helper_body, indent, source) + "\n\n"
 
     call_args = [helper_name]
     if extra_src:
@@ -675,24 +708,53 @@ def classify_pcall(
     return details
 
 
-def _reindent_helper(helper: str, indent: str) -> str:
-    """Force helper to `indent` at the `local function` / `end` lines.
+def _indent_unit(source: str) -> str:
+    """One indent step: tab if the file uses tabs, else 4 spaces."""
+    for line in source.split("\n"):
+        if line.startswith("\t"):
+            return "\t"
+        stripped = line.lstrip(" ")
+        if stripped != line and line.startswith("    "):
+            return "    "
+    return "\t"
 
-    Inner lines keep relative indent vs the original `function` line.
-    """
+
+def _reindent_helper(helper: str, indent: str, source: str) -> str:
+    """`local function` / `end` at insert indent; body one step in."""
     lines = helper.split("\n")
+    while lines and lines[-1] == "":
+        lines.pop()
     if not lines:
         return helper
-    first = lines[0]
-    orig_indent = first[: len(first) - len(first.lstrip(" \t"))]
-    out = []
-    for line in lines:
-        if not line.strip():
+    unit = _indent_unit(source)
+    if len(lines) == 1:
+        return indent + lines[0].lstrip(" \t")
+    first = indent + lines[0].lstrip(" \t")
+    last = indent + "end"
+    middle = lines[1:-1]
+    # last line should be `end`; if the original was `... end` on the body
+    # line, keep that line as middle and still emit our `end`.
+    if lines[-1].lstrip(" \t") != "end":
+        middle = lines[1:]
+    out = [first]
+    nonempty = [m for m in middle if m.strip()]
+    common = None
+    for m in nonempty:
+        lead = m[: len(m) - len(m.lstrip(" \t"))]
+        if common is None or (lead and m.startswith(common) and len(lead) < len(common)):
+            common = lead
+        elif common and not m.startswith(common):
+            common = ""
+            break
+    if common is None:
+        common = ""
+    for m in middle:
+        if not m.strip():
             out.append("")
             continue
-        if orig_indent and line.startswith(orig_indent):
-            line = line[len(orig_indent):]
-        out.append(indent + line)
+        body = m[len(common):] if common and m.startswith(common) else m.lstrip(" \t")
+        out.append(indent + unit + body)
+    out.append(last)
     return "\n".join(out)
 
 
