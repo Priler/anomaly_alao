@@ -35,8 +35,8 @@ PERFORMANCE_IMPACT = {
     'table_insert_append': 'high',
     'math_pow_simple': 'high',
     'string_format_in_loop': 'high',
-    'pcall_anon_hoist': 'high',
-    'pcall_anon_skip': 'high',
+    'anon_hoist': 'high',
+    'anon_skip': 'high',
 
     # MEDIUM - low to moderate impact
     'uncached_globals_summary': 'medium',
@@ -101,8 +101,8 @@ def highlight_code_match(line_content: str, details: dict, pattern_name: str) ->
     elif pattern_name == 'uncached_globals_summary':
         # for summary, don't highlight (multi-line examples)
         return escaped
-    elif pattern_name in ('pcall_anon_hoist', 'pcall_anon_skip'):
-        match_text = details.get('full_match') or 'pcall(function'
+    elif pattern_name in ('anon_hoist', 'anon_skip'):
+        match_text = details.get('full_match') or 'function('
 
     if match_text:
         escaped_match = html.escape(match_text)
@@ -354,10 +354,10 @@ class Reporter:
         # skip internal fields that aren't useful in reports
         skip_keys = {
             'node', 'nodes', 'ast_node', 'call_node',
-            # pcall hoist internals - used by the transformer, not reports
-            'helper_text', 'insert_char', 'insert_seq', 'replace_start', 'replace_end',
-            'fn_start', 'fn_end', 'helper_params', 'absorb_callsite',
-            'replace_text', 'safe',
+            # anon hoist internals - used by the transformer, not reports
+            'anon_text', 'insert_char', 'insert_seq', 'replace_start', 'replace_end',
+            'fn_start', 'fn_end', 'anon_params', 'absorb_callsite',
+            'replace_text', 'safe', 'raw_func',
         }
         
         result = {}
@@ -514,9 +514,9 @@ def format_details(details: dict) -> str:
 
     skip_keys = {
         'node', 'nodes', 'ast_node', 'call_node',
-        'helper_text', 'insert_char', 'insert_seq', 'replace_start', 'replace_end',
-        'fn_start', 'fn_end', 'helper_params', 'absorb_callsite',
-        'replace_text', 'safe',
+        'anon_text', 'insert_char', 'insert_seq', 'replace_start', 'replace_end',
+        'fn_start', 'fn_end', 'anon_params', 'absorb_callsite',
+        'replace_text', 'safe', 'raw_func',
     }
 
     parts = []

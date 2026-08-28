@@ -1,15 +1,21 @@
-"""Hoist pcall/xpcall(function() ... end) to a named local at file scope.
+"""Hoist anonymous `function() ... end` to a named local at file scope.
 
-Every run of `pcall(function() ... end)` builds a new closure. We lift the
-body to `local function foo_pcall_1(...)` once, then call that.
+Every run of `foo(function() ... end)` builds a new closure. We lift the
+body to `local foo_anon_1 = function(...)` once, then use that name.
 
 Only when we can prove the rewrite does the same thing. Anything else stays
 as-is and is reported RED.
 
-Two rewrites:
-- read-only body: hoist as-is, pass used names as extra args
-- one `x = expr` to an outer name: helper returns expr; assign x only if pcall
+When we can pass extra args (`pcall` only):
+- read-only body: hoist, pass used names as extra args
+- one `x = expr` to an outer name: anon func returns expr; assign x only if pcall
   succeeded (a failed pcall must not store the error string in x)
+
+Everyone else (`table.sort`, `x or function()`, callbacks): same params, no
+extra names. Captures or outer writes -> skip. Lua 5.1 `xpcall` is the same.
+
+Own `...` (this function's param) stays. Outer `...` is passed on pcall only
+(`pcall(fn, ...)`). Callers that cannot take extra args still skip.
 """
 
 from __future__ import annotations
@@ -61,6 +67,15 @@ from luaparser.astnodes import (
 _TOKEN_START = re.compile(r"\[@\d+,(\d+):\d+='")
 _TOKEN_END = re.compile(r"\[@\d+,\d+:(\d+)='")
 _FUNC_HEADER = re.compile(r"^function\s*\([^)]*\)", re.DOTALL)
+# Skip leading `(`, spaces, and comments. Group 1 is `function(...)`.
+_FUNC_LEAD = re.compile(
+    r"^[ \t\n]*\(?[ \t\n]*(?:--(?:\[\[.*?\]\]|[^\n]*(?:\n[ \t\n]*|$))[ \t\n]*)*(function\s*\([^)]*\))",
+    re.DOTALL,
+)
+_END_TOKEN = re.compile(r"(?<![A-Za-z0-9_])end(?![A-Za-z0-9_])")
+# Parser sometimes glues `-- comment` onto the function span. Not part of it.
+_TRAIL_COMMENT = re.compile(r"(?:[ \t]*(?:--[^\n]*)?\n?)*\Z")
+# Last line already ends with `end` (`end`, `) end`, `return x end`).
 _TRAIL_END = re.compile(r"^(.*?)(?<![A-Za-z0-9_])end\s*$")
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LUA_KEYWORDS = frozenset({
@@ -98,11 +113,34 @@ def node_span(node) -> Tuple[Optional[int], Optional[int]]:
     return start, end
 
 
-def _pcall_call_span(source: str, call: Call) -> Tuple[Optional[int], Optional[int]]:
-    """Span of the whole `pcall(...)` / `xpcall(...)`, name included.
+def _anon_span(source: str, anon) -> Tuple[Optional[int], Optional[int]]:
+    """True `function ... end` slice. Parser often includes `( ... )` and a trailing comment."""
+    start, end = node_span(anon)
+    if start is None or end is None:
+        return None, None
+    lead = _FUNC_LEAD.match(source[start:end])
+    if lead:
+        start = start + lead.start(1)
+    body = source[start:end]
+    # Extra `)` from `( function() ... end )`.
+    while body.endswith(")") and body.count(")") > body.count("("):
+        end -= 1
+        while end > start and source[end - 1] in " \t\n":
+            end -= 1
+        body = source[start:end]
+    last = None
+    for m in _END_TOKEN.finditer(body):
+        last = m
+    if last and _TRAIL_COMMENT.match(body[last.end():]):
+        end = start + last.end()
+    return start, end
+
+
+def _callee_call_span(source: str, call: Call) -> Tuple[Optional[int], Optional[int]]:
+    """Span of the whole `name(...)`, callee included.
 
     Parser often starts the call at `(`. Replacing from there writes
-    `pcall(...)` again and you get `pcallpcall(...)`.
+    the name again and you get `name name(...)`.
     """
     start, end = node_span(call)
     if end is None:
@@ -126,7 +164,7 @@ def _pcall_call_span(source: str, call: Call) -> Tuple[Optional[int], Optional[i
 
 
 def _walk_back_to_callee(source: str, pos: int) -> Optional[int]:
-    """From `pcall`, `(`, or mid-name, return the start of pcall/xpcall."""
+    """From `(`, walk back to the name. Only pcall / xpcall get a full-call rewrite."""
     i = pos
     if 0 <= i < len(source) and source[i] == "(":
         i -= 1
@@ -138,6 +176,7 @@ def _walk_back_to_callee(source: str, pos: int) -> Optional[int]:
     j = start
     while j < len(source) and (source[j].isalnum() or source[j] == "_"):
         j += 1
+    # Everyone else replaces the function only, not the whole call.
     if source[start:j] in ("pcall", "xpcall"):
         return start
     return None
@@ -179,7 +218,28 @@ def _is_bracket_idx(idx) -> bool:
     return tok is not None and str(tok) != "None"
 
 
+def _index_path(node) -> Optional[str]:
+    """Name or `a.b.c` flattened to `a_b_c`."""
+    if isinstance(node, Name):
+        return node.id
+    if not isinstance(node, Index):
+        return None
+    parts = []
+    cur = node
+    while isinstance(cur, Index):
+        idx = _name_id(cur.idx)
+        if idx:
+            parts.append(idx)
+        cur = cur.value
+    base = _name_id(cur)
+    if base:
+        parts.append(base)
+    parts.reverse()
+    return "_".join(parts) if parts else None
+
+
 def sanitize_ident(raw: str) -> str:
+    """Safe Lua name for the caller prefix (`foo.bar` -> `foo_bar`)."""
     s = re.sub(r"[^A-Za-z0-9_]", "_", raw or "")
     s = re.sub(r"_+", "_", s).strip("_")
     if not s or s[0].isdigit() or s in _LUA_KEYWORDS:
@@ -193,23 +253,7 @@ def _func_display_name(node) -> Optional[str]:
     if isinstance(node, LocalFunction):
         return _name_id(node.name)
     if isinstance(node, Function):
-        name = node.name
-        if isinstance(name, Name):
-            return name.id
-        if isinstance(name, Index):
-            parts = []
-            cur = name
-            while isinstance(cur, Index):
-                idx = _name_id(cur.idx)
-                if idx:
-                    parts.append(idx)
-                cur = cur.value
-            base = _name_id(cur)
-            if base:
-                parts.append(base)
-            parts.reverse()
-            return "_".join(parts) if parts else None
-        return None
+        return _index_path(node.name)
     if isinstance(node, Method):
         src = _name_id(getattr(node, "source", None)) or "obj"
         meth = _name_id(getattr(node, "name", None)) or "method"
@@ -225,26 +269,7 @@ def _assigned_func_name(func_node, parents) -> Optional[str]:
     if not isinstance(p, (Assign, LocalAssign)):
         return None
     targets = getattr(p, "targets", None) or []
-    if not targets:
-        return None
-    t = targets[0]
-    name = _name_id(t)
-    if name:
-        return name
-    if isinstance(t, Index):
-        parts = []
-        cur = t
-        while isinstance(cur, Index):
-            idx = _name_id(cur.idx)
-            if idx:
-                parts.append(idx)
-            cur = cur.value
-        base = _name_id(cur)
-        if base:
-            parts.append(base)
-        parts.reverse()
-        return "_".join(parts) if parts else None
-    return None
+    return _index_path(targets[0]) if targets else None
 
 
 def _caller_name(scope, parents) -> str:
@@ -267,7 +292,7 @@ def _caller_name(scope, parents) -> str:
 def _chunk_stmt(node, parents):
     """File-scope statement that owns `node` (`local function`, `foo =`, `do`).
 
-    Helpers go above this, not inside the hot function.
+    Anons go above this, not inside the hot function.
     """
     if not parents or node is None:
         return None
@@ -284,6 +309,7 @@ def _chunk_stmt(node, parents):
 
 
 def _all_taken_names(scopes) -> Set[str]:
+    """Names we must not reuse for a hoisted func or a temp."""
     taken: Set[str] = set(_LUA_KEYWORDS)
     if not scopes:
         return taken
@@ -295,15 +321,16 @@ def _all_taken_names(scopes) -> Set[str]:
     return taken
 
 
-def _helper_seq(name: str) -> int:
-    m = re.search(r"_pcall_(\d+)$", name or "")
+def _anon_seq(name: str) -> int:
+    m = re.search(r"_anon_(\d+)$", name or "")
     return int(m.group(1)) if m else 0
 
 
-def pick_helper_name(caller: str, taken: Set[str]) -> Optional[str]:
+def pick_anon_name(caller: str, taken: Set[str]) -> Optional[str]:
+    """First free `foo_anon_1`, `foo_anon_2`, ... Marks it taken."""
     base = sanitize_ident(caller)
     for n in range(1, 10000):
-        name = f"{base}_pcall_{n}"
+        name = f"{base}_anon_{n}"
         if name not in taken:
             taken.add(name)
             return name
@@ -311,6 +338,7 @@ def pick_helper_name(caller: str, taken: Set[str]) -> Optional[str]:
 
 
 def pick_temp(base: str, taken: Set[str]) -> str:
+    """`_ok` / `_x` temps that must not clash with locals already in the file."""
     if base not in taken:
         taken.add(base)
         return base
@@ -325,6 +353,7 @@ def pick_temp(base: str, taken: Set[str]) -> str:
 
 @dataclass
 class AnonUse:
+    """What the body does to names outside itself."""
     reads: Set[str] = field(default_factory=set)
     writes: Set[str] = field(default_factory=set)
     uses_dots: bool = False
@@ -342,13 +371,13 @@ _WALK_OK = (
 
 
 def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None, on_unknown=None):
-    """Walk the body. Track locals. Callers listen for one kind of event.
+    """Walk the body. Track names born here. Callers listen for free names.
 
     Bind vs write:
-    - `local x = rhs`: new x inside the pcall. Walk rhs, then bind x.
+    - `local x = rhs`: new x inside this function. Walk rhs, then bind x.
     - `x = rhs`: write of an outer x. Then walk rhs.
 
-    Free name = used here, not bound in this function (or a nested one).
+    Free name = used here, not bound in this function or a nested one.
     """
     stack: List[Set[str]] = [set()]
 
@@ -367,7 +396,9 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
         if node is None or isinstance(node, _LEAF):
             return
         if isinstance(node, (Dots, Varargs)):
-            dots()
+            # Own `...` is a param on the stack. Else it is an outer function's.
+            if not is_inner("..."):
+                dots()
             return
         if isinstance(node, Goto):
             if on_goto:
@@ -376,7 +407,8 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
         if isinstance(node, Name):
             name = node.id
             if name == "...":
-                dots()
+                if not is_inner("..."):
+                    dots()
                 return
             if not name or is_inner(name):
                 return
@@ -418,6 +450,7 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
                 walk(v)
             return
         if isinstance(node, (Function, LocalFunction, Method, AnonymousFunction)):
+            # Nested function: its locals are not free names of the outer.
             if isinstance(node, LocalFunction):
                 add_inner(_name_id(node.name))
             stack.append(set())
@@ -425,12 +458,14 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
                 add_inner("self")
             for arg in getattr(node, "args", None) or []:
                 if isinstance(arg, (Dots, Varargs)):
-                    dots()
-                add_inner(_name_id(arg))
+                    add_inner("...")
+                else:
+                    add_inner(_name_id(arg))
             walk(getattr(node, "body", None))
             stack.pop()
             return
         if isinstance(node, Fornum):
+            # `for i =` : i is local to the loop.
             walk(getattr(node, "start", None))
             walk(getattr(node, "stop", None))
             walk(getattr(node, "step", None))
@@ -440,6 +475,7 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
             stack.pop()
             return
         if isinstance(node, Forin):
+            # `for k, v in` : k and v are local to the loop.
             for it in getattr(node, "iter", None) or []:
                 walk(it)
             stack.append(set())
@@ -458,6 +494,7 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
             stack.pop()
             return
         if isinstance(node, If):
+            # Each then / elseif / else has its own locals.
             walk(getattr(node, "test", None))
             stack.append(set())
             walk(getattr(node, "body", None))
@@ -490,19 +527,21 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
 
     for arg in getattr(anon, "args", None) or []:
         if isinstance(arg, (Dots, Varargs)):
-            dots()
-        add_inner(_name_id(arg))
+            add_inner("...")
+        else:
+            add_inner(_name_id(arg))
     walk(getattr(anon, "body", None))
 
 
 def _analyze_anon(anon: AnonymousFunction) -> AnonUse:
-    """Three passes over the same body.
-
-    1. Can we read this? Unknown syntax, `...`, or goto -> stop.
-    2. Writes: outer `x =`. `local x =` does not count.
-    3. Reads: names used as values (captures).
-    """
+    """One walk: unknown / outer `...` / goto, plus outer reads and writes."""
     use = AnonUse()
+
+    def on_free(name, is_write):
+        if is_write:
+            use.writes.add(name)
+        else:
+            use.reads.add(name)
 
     def mark_dots():
         use.uses_dots = True
@@ -513,30 +552,33 @@ def _analyze_anon(anon: AnonymousFunction) -> AnonUse:
     def mark_unknown():
         use.unknown = True
 
-    _walk_anon(anon, on_dots=mark_dots, on_goto=mark_goto, on_unknown=mark_unknown)
-    if use.unknown or use.uses_dots or use.has_goto:
-        return use
-
-    writes: Set[str] = set()
-    _walk_anon(anon, on_free=lambda name, is_write: writes.add(name) if is_write else None)
-    reads: Set[str] = set()
-    _walk_anon(anon, on_free=lambda name, is_write: reads.add(name) if not is_write else None)
-
-    use.writes = writes
-    use.reads = reads
+    _walk_anon(anon, on_free=on_free, on_dots=mark_dots, on_goto=mark_goto, on_unknown=mark_unknown)
     return use
 
 
 def _anon_params(anon: AnonymousFunction) -> Optional[List[str]]:
+    """Declared args. `...` is allowed and must be last."""
     params: List[str] = []
     for arg in getattr(anon, "args", None) or []:
         if isinstance(arg, (Dots, Varargs)):
-            return None
+            params.append("...")
+            continue
         name = _name_id(arg)
         if not name:
             return None
         params.append(name)
+    if "..." in params and params[-1] != "...":
+        return None
     return params
+
+
+def _params_with_dots(orig: List[str], extra: List[str], outer_dots: bool) -> List[str]:
+    """Named args, then extra captures, then `...` last if we keep or pass it."""
+    named = [p for p in orig if p != "..."]
+    named.extend(extra)
+    if outer_dots or "..." in orig:
+        named.append("...")
+    return named
 
 
 def _single_capture_assign(anon: AnonymousFunction, writes: Set[str]) -> Optional[Tuple[str, Any]]:
@@ -564,8 +606,10 @@ def _call_kind(call: Call) -> Optional[str]:
     return None
 
 
-def _parent_map(root) -> Dict[int, Any]:
+def _collect_anons_and_parents(root) -> Tuple[List[AnonymousFunction], Dict[int, Any]]:
+    """One walk: every unnamed function, plus the parent of every node."""
     parents: Dict[int, Any] = {}
+    anons: List[AnonymousFunction] = []
 
     def walk(node, parent=None):
         if node is None or isinstance(node, (str, int, float, bool, bytes)):
@@ -575,18 +619,21 @@ def _parent_map(root) -> Dict[int, Any]:
                 walk(item, parent)
             return
         parents[id(node)] = parent
+        if isinstance(node, AnonymousFunction):
+            anons.append(node)
         for child in _iter_children(node):
             walk(child, node)
 
     walk(root)
-    return parents
+    return anons, parents
 
 
 def _assign_context(call: Call, parent) -> Tuple[str, int, Optional[str], Optional[Any]]:
     """How the pcall sits in the parent.
 
-    Returns (kind, n_targets, ok_name, assign_node).
-    kind: 'stmt' | 'assign' | 'expr'
+    stmt: `pcall(...)` alone.
+    assign: `ok = pcall(...)` or `local ok = pcall(...)`.
+    expr: inside a bigger expression. We cannot rewrite that.
     """
     if isinstance(parent, Block):
         return "stmt", 0, None, None
@@ -629,59 +676,162 @@ def _rhs_src(source: str, value_node) -> Optional[str]:
     return source[start:end]
 
 
-def _replace_func_header(func_src: str, helper_name: str, params: List[str]) -> Optional[str]:
-    if not _FUNC_HEADER.match(func_src):
+def _unwrap_func_src(func_src: str) -> Optional[str]:
+    """Drop a wrapping `(` the parser sometimes includes. Need `function` first."""
+    m = _FUNC_LEAD.match(func_src)
+    if not m:
         return None
-    header = f"local function {helper_name}({', '.join(params)})"
-    return _FUNC_HEADER.sub(header, func_src, count=1)
+    return func_src[m.start(1):]
 
 
-def classify_pcall(
-    call: Call,
+def _replace_func_header(func_src: str, anon_name: str, params: List[str]) -> Optional[str]:
+    """Prefix: `function(...)` becomes `local name = function(...)`. Rest stays."""
+    body = _unwrap_func_src(func_src)
+    if body is None or not _FUNC_HEADER.match(body):
+        return None
+    header = f"local {anon_name} = function({', '.join(params)})"
+    return _FUNC_HEADER.sub(header, body, count=1)
+
+
+def _anon_role(anon, parent) -> str:
+    """pcall / xpcall if this function is the first arg. Else expr."""
+    if isinstance(parent, Call):
+        kind = _call_kind(parent)
+        args = list(getattr(parent, "args", None) or [])
+        if kind == "pcall" and args and args[0] is anon:
+            return "pcall"
+        if kind == "xpcall" and args and args[0] is anon:
+            return "xpcall"
+    return "expr"
+
+
+def _is_chunk_func_def(anon, parent, parents) -> bool:
+    """`foo = function()` / `local foo = function()` at file scope. Already named."""
+    if not isinstance(parent, (Assign, LocalAssign)):
+        return False
+    values = getattr(parent, "values", None) or []
+    if len(values) != 1 or values[0] is not anon:
+        return False
+    return _chunk_stmt(parent, parents) is parent
+
+
+def _chunk_local_decl_pos(tree) -> Dict[str, int]:
+    """First `local x` / `local function x` at file scope, by name."""
+    pos: Dict[str, int] = {}
+    block = getattr(tree, "body", None)
+    stmts = getattr(block, "body", None) if block is not None else None
+    if not stmts:
+        return pos
+    for s in stmts:
+        names = []
+        if isinstance(s, LocalAssign):
+            names = [_name_id(t) for t in (getattr(s, "targets", None) or [])]
+        elif isinstance(s, LocalFunction):
+            names = [_name_id(s.name)]
+        st, _ = node_span(s)
+        if st is None:
+            continue
+        for name in names:
+            if name and name not in pos:
+                pos[name] = st
+    return pos
+
+
+def _enclosing_bound_names(scope, anon) -> Set[str]:
+    """Locals from scopes around this function, not the function itself.
+
+    Globals and file-scope locals are not in here. Those stay visible after
+    we hoist to file scope. A name that is here must be passed as an extra
+    arg (pcall only) or we skip.
+    """
+    names: Set[str] = set()
+    s = scope
+    while s is not None:
+        if getattr(s, "node", None) is anon:
+            s = getattr(s, "parent", None)
+            continue
+        st = getattr(s, "scope_type", None)
+        if st and st != "global":
+            names.update(getattr(s, "locals", ()) or ())
+        s = getattr(s, "parent", None)
+    return names
+
+
+def _scope_for(node, analyzer, parents):
+    """Nearest analyzer scope that owns this node."""
+    by_id = {}
+    for s in getattr(analyzer, "scopes", None) or []:
+        n = getattr(s, "node", None)
+        if n is not None:
+            by_id[id(n)] = s
+    cur = node
+    while cur is not None:
+        s = by_id.get(id(cur))
+        if s is not None:
+            return s
+        cur = parents.get(id(cur)) if parents else None
+    return getattr(analyzer, "global_scope", None)
+
+
+def _node_line(source: str, node) -> int:
+    start, _ = node_span(node)
+    if start is None:
+        return 0
+    return source.count("\n", 0, start) + 1
+
+
+def classify_anon(
+    anon: AnonymousFunction,
     source: str,
     scope,
     parent,
     taken: Set[str],
-    scopes=None,
     parents=None,
+    chunk_locals=None,
 ) -> Dict[str, Any]:
     """Decide hoist vs skip. `safe` True means we will rewrite.
 
-    Skip if: not bare pcall/xpcall, first arg not `function()`, `...`, goto,
-    unknown syntax, xpcall with extra names (Lua 5.1 cannot pass them),
-    outer writes that are not a single `x = expr`, or we cannot slice tokens.
+    Skip if: outer `...` where the caller cannot take extra args, goto,
+    unknown syntax, outer writes that are not a single `x = expr` on pcall,
+    enclosing-function locals where the caller cannot take extra args
+    (everything except pcall; xpcall never can), or we cannot slice tokens.
+    Own `...` is fine. Globals and earlier file-scope locals are fine.
     """
     details: Dict[str, Any] = {"safe": False}
+    # pcall / xpcall first arg, or just a function sitting in an expression.
+    role = _anon_role(anon, parent)
+    details["role"] = role
+    details["callee"] = role if role in ("pcall", "xpcall") else "function"
+    details["full_match"] = f"{details['callee']}(function" if role != "expr" else "function("
 
-    kind = _call_kind(call)
-    if kind is None:
-        details["skip_reason"] = "callee is not bare pcall/xpcall"
-        return details
-    details["callee"] = kind
-    details["full_match"] = f"{kind}(function"
-
-    args = list(getattr(call, "args", None) or [])
-    if not args or not isinstance(args[0], AnonymousFunction):
-        details["skip_reason"] = "first arg is not an anonymous function"
-        return details
-
-    if kind == "xpcall" and len(args) != 2:
-        details["skip_reason"] = "xpcall must be xpcall(fn, err)"
-        return details
-
-    anon = args[0]
-    fn_start, fn_end = node_span(anon)
-    call_start, call_end = _pcall_call_span(source, call)
-    if None in (fn_start, fn_end, call_start, call_end):
+    fn_start, fn_end = _anon_span(source, anon)
+    if None in (fn_start, fn_end):
         details["skip_reason"] = "missing first_token/last_token"
         return details
 
+    call = parent if role in ("pcall", "xpcall") else None
+    call_start = call_end = None
+    extra_src = ""
+    if call is not None:
+        call_start, call_end = _callee_call_span(source, call)
+        if None in (call_start, call_end):
+            details["skip_reason"] = "missing first_token/last_token"
+            return details
+        args = list(getattr(call, "args", None) or [])
+        # Lua 5.1 xpcall is only (fn, err). No extra args, no other shapes.
+        if role == "xpcall" and len(args) != 2:
+            details["skip_reason"] = "xpcall must be xpcall(fn, err)"
+            return details
+        extra_src = _extra_args_src(source, args[1:])
+        if extra_src is None:
+            details["skip_reason"] = "cannot slice extra pcall args"
+            return details
+
+    # Body must be something we can read. Outer `...` is not a skip here;
+    # pcall can pass it. Goto or unknown syntax -> skip.
     use = _analyze_anon(anon)
     if use.unknown:
         details["skip_reason"] = "anonymous function has unknown syntax"
-        return details
-    if use.uses_dots:
-        details["skip_reason"] = "anonymous function uses ..."
         return details
     if use.has_goto:
         details["skip_reason"] = "anonymous function uses goto"
@@ -692,8 +842,9 @@ def classify_pcall(
         details["skip_reason"] = "anonymous function has unusable params"
         return details
 
+    # Named after the function we sit in. Inserted above that file-scope statement.
     caller = _caller_name(scope, parents)
-    insert_node = _chunk_stmt(call, parents)
+    insert_node = _chunk_stmt(anon, parents)
     if insert_node is None:
         details["skip_reason"] = "cannot find chunk-level insert point"
         return details
@@ -703,24 +854,19 @@ def classify_pcall(
         return details
     insert_char = _line_start(source, ins_start)
 
-    ctx_kind, n_targets, ok_name, assign_node = _assign_context(call, parent)
-    extra = args[1:]
-    extra_src = _extra_args_src(source, extra)
-    if extra_src is None:
-        details["skip_reason"] = "cannot slice extra pcall args"
-        return details
-
     writes = set(use.writes)
     reads = set(use.reads) - writes
+    # Only safe write: body is exactly `x = expr` on pcall. Else skip.
     assign_info = _single_capture_assign(anon, writes) if writes else None
 
-    # Outer write only if the whole body is `x = expr`. Else leave it.
-    if writes and assign_info is None:
+    if writes and (role != "pcall" or assign_info is None):
         details["skip_reason"] = "writes captured locals (not a single x = expr)"
         details["writes"] = sorted(writes)
         return details
 
     if writes and assign_info is not None:
+        call_parent = parents.get(id(call)) if parents and call is not None else None
+        ctx_kind, n_targets, ok_name, assign_node = _assign_context(call, call_parent)
         if ctx_kind == "expr":
             details["skip_reason"] = "assign rewrite not safe in expression context"
             return details
@@ -733,10 +879,6 @@ def classify_pcall(
             details["skip_reason"] = "cannot slice assignment rhs"
             return details
         leftover = sorted(reads)
-        if kind == "xpcall" and leftover:
-            # xpcall(fn, err) only. No room to pass captures.
-            details["skip_reason"] = "xpcall cannot take extra args (Lua 5.1)"
-            return details
         a_start = a_end = None
         if ctx_kind != "stmt":
             a_start, a_end = node_span(assign_node)
@@ -744,30 +886,34 @@ def classify_pcall(
                 details["skip_reason"] = "cannot slice parent assign"
                 return details
 
-        helper_name = pick_helper_name(caller, taken)
-        if helper_name is None:
-            details["skip_reason"] = "cannot allocate helper name"
+        anon_name = pick_anon_name(caller, taken)
+        if anon_name is None:
+            details["skip_reason"] = "cannot allocate anon name"
             return details
 
-        helper_params = list(orig_params) + leftover
+        # Assign rewrite is pcall. Outer `...` is just another extra arg.
+        anon_params = _params_with_dots(orig_params, leftover, use.uses_dots)
         indent = _line_indent(source, insert_char)
         inner = indent + _indent_unit(source)
 
-        helper_text = (
-            f"{indent}local function {helper_name}({', '.join(helper_params)})\n"
+        anon_text = (
+            f"{indent}local {anon_name} = function({', '.join(anon_params)})\n"
             f"{inner}return {rhs_src}\n"
             f"{indent}end\n\n"
         )
 
-        call_args = [helper_name]
+        call_args = [anon_name]
         if extra_src:
             call_args.append(extra_src)
         call_args.extend(leftover)
-        new_call = f"{kind}({', '.join(call_args)})"
+        if use.uses_dots:
+            call_args.append("...")
+        new_call = f"pcall({', '.join(call_args)})"
 
         stmt_indent = _line_indent(source, call_start)
         val_name = pick_temp(f"_{assigned}", taken)
-        # Helper returns the expr. Copy into x only when pcall succeeded.
+        # Return the expr. Copy into x only when pcall succeeded.
+        # A failed pcall's second result is the error string; that must not land in x.
         if ctx_kind == "stmt":
             ok_temp = pick_temp("_ok", taken)
             replace_start, replace_end = call_start, call_end
@@ -776,7 +922,6 @@ def classify_pcall(
                 f"{stmt_indent}if {ok_temp} then {assigned} = {val_name} end"
             )
         else:
-            # keep existing ok target; widen to two results
             ok_temp = ok_name or pick_temp("_ok", taken)
             local_kw = "local " if isinstance(assign_node, LocalAssign) else ""
             replace_start, replace_end = a_start, a_end
@@ -788,14 +933,14 @@ def classify_pcall(
         details.update({
             "safe": True,
             "rewrite_kind": "assign",
-            "helper_name": helper_name,
-            "helper_params": helper_params,
-            "captures": leftover,
-            "helper_text": helper_text,
+            "anon_name": anon_name,
+            "anon_params": anon_params,
+            "captures": leftover + (["..."] if use.uses_dots else []),
+            "anon_text": anon_text,
             "fn_start": fn_start,
             "fn_end": fn_end,
             "insert_char": insert_char,
-            "insert_seq": _helper_seq(helper_name),
+            "insert_seq": _anon_seq(anon_name),
             "replace_start": replace_start,
             "replace_end": replace_end,
             "replace_text": replace_text,
@@ -803,49 +948,91 @@ def classify_pcall(
         })
         return details
 
-    # No outer writes: lift the body, pass names it reads.
     captures = sorted(reads)
-    if kind == "xpcall" and captures:
-        details["skip_reason"] = "xpcall cannot take extra args (Lua 5.1)"
-        details["captures"] = captures
+    enclosing = _enclosing_bound_names(scope, anon)
+    must_forward = [c for c in captures if c in enclosing]
+    # pcall can take extra args. table.sort / xpcall / `x or function()` cannot.
+    can_forward = role == "pcall"
+    # Outer `...` needs the same extra-arg slot as a captured local.
+    if use.uses_dots and not can_forward:
+        details["skip_reason"] = (
+            "xpcall cannot take extra args (Lua 5.1)"
+            if role == "xpcall"
+            else "caller cannot take extra args"
+        )
+        details["captures"] = ["..."]
+        return details
+    if must_forward and not can_forward:
+        details["skip_reason"] = (
+            "xpcall cannot take extra args (Lua 5.1)"
+            if role == "xpcall"
+            else "caller cannot take extra args"
+        )
+        details["captures"] = must_forward
+        return details
+    # File-scope `local later` after the insert only matters if this function
+    # was compiled after that local (it captured it). If the function sits
+    # above the local, it already sees a global. Same after hoist.
+    late = []
+    if not can_forward and chunk_locals:
+        late = [
+            c for c in captures
+            if c not in enclosing
+            and c in chunk_locals
+            and insert_char <= chunk_locals[c] <= fn_start
+        ]
+        if late:
+            details["skip_reason"] = "uses local declared after anon"
+            details["captures"] = late
+            return details
+
+    anon_name = pick_anon_name(caller, taken)
+    if anon_name is None:
+        details["skip_reason"] = "cannot allocate anon name"
         return details
 
-    helper_name = pick_helper_name(caller, taken)
-    if helper_name is None:
-        details["skip_reason"] = "cannot allocate helper name"
-        return details
-
+    # Same body, new name. pcall gets extra args for captures and outer `...`.
+    # Everyone else: name only. Own `...` stays on the param list.
     func_src = source[fn_start:fn_end]
-    helper_params = list(orig_params) + captures
-    helper_body = _replace_func_header(func_src, helper_name, helper_params)
-    if helper_body is None:
+    extra = captures if can_forward else []
+    anon_params = _params_with_dots(orig_params, extra, use.uses_dots and can_forward)
+    anon_body = _replace_func_header(func_src, anon_name, anon_params)
+    if anon_body is None:
         details["skip_reason"] = "cannot rewrite function header"
         return details
 
     indent = _line_indent(source, insert_char)
-    # Header replace keeps the original `function` indent (often deeper than
-    # chunk). Re-indent the whole helper to the insert line's indent.
-    helper_text = _reindent_helper(helper_body, indent, source) + "\n\n"
+    anon_text = _reindent_anon(anon_body, indent, source) + "\n\n"
 
-    call_args = [helper_name]
-    if extra_src:
-        call_args.append(extra_src)
-    call_args.extend(captures)
-    replace_text = f"{kind}({', '.join(call_args)})"
+    if role in ("pcall", "xpcall"):
+        # `pcall(function() ... end, extra)` -> `pcall(name, extra, captures...)`
+        call_args = [anon_name]
+        if extra_src:
+            call_args.append(extra_src)
+        if can_forward:
+            call_args.extend(captures)
+        if use.uses_dots and can_forward:
+            call_args.append("...")
+        replace_text = f"{role}({', '.join(call_args)})"
+        replace_start, replace_end = call_start, call_end
+    else:
+        # `table.sort(t, function() ... end)` / `x or function()` -> just the name.
+        replace_text = anon_name
+        replace_start, replace_end = fn_start, fn_end
 
     details.update({
         "safe": True,
         "rewrite_kind": "hoist",
-        "helper_name": helper_name,
-        "helper_params": helper_params,
-        "captures": captures,
-        "helper_text": helper_text,
+        "anon_name": anon_name,
+        "anon_params": anon_params,
+        "captures": (captures + (["..."] if use.uses_dots else [])) if can_forward else [],
+        "anon_text": anon_text,
         "fn_start": fn_start,
         "fn_end": fn_end,
         "insert_char": insert_char,
-        "insert_seq": _helper_seq(helper_name),
-        "replace_start": call_start,
-        "replace_end": call_end,
+        "insert_seq": _anon_seq(anon_name),
+        "replace_start": replace_start,
+        "replace_end": replace_end,
         "replace_text": replace_text,
         "caller": caller,
     })
@@ -863,21 +1050,21 @@ def _indent_unit(source: str) -> str:
     return "\t"
 
 
-def _reindent_helper(helper: str, indent: str, source: str) -> str:
-    """`local function` / `end` at insert indent; body one step in."""
-    lines = helper.split("\n")
+def _reindent_anon(text: str, indent: str, source: str) -> str:
+    """`local name = function` / `end` at insert indent; body one step in."""
+    lines = text.split("\n")
     while lines and lines[-1] == "":
         lines.pop()
     if not lines:
-        return helper
+        return text
     unit = _indent_unit(source)
     if len(lines) == 1:
         return indent + lines[0].lstrip(" \t")
     first = indent + lines[0].lstrip(" \t")
     last = indent + "end"
-    # Last line already has `end` (`end`, `) end`, `return x end`). Keep the
-    # rest of that line. Always write one `end` of our own. Packer writes
-    # `return foo(\n...\n) end`; keeping `) end` and adding `end` breaks parse.
+    # Keep anything before the last `end` (`) end`, `return x end`). Always
+    # write one `end` of our own. Packer `return foo(\n)\n) end` plus a second
+    # `end` does not parse.
     trail = _TRAIL_END.match(lines[-1].rstrip())
     if trail:
         middle = list(lines[1:-1])
@@ -887,6 +1074,7 @@ def _reindent_helper(helper: str, indent: str, source: str) -> str:
     else:
         middle = lines[1:]
     out = [first]
+    # Strip the old common indent, then indent + one step.
     nonempty = [m for m in middle if m.strip()]
     common = None
     for m in nonempty:
@@ -909,56 +1097,70 @@ def _reindent_helper(helper: str, indent: str, source: str) -> str:
 
 
 def analyze_tree(analyzer) -> None:
-    """Emit pcall_anon_hoist / pcall_anon_skip findings onto analyzer."""
+    """Collect, classify once (smallest first), splice inners into outers, report."""
     tree = getattr(analyzer, "_ast_tree", None)
     if tree is None:
         return
     source = analyzer.source
-    parents = _parent_map(tree)
+    anons, parents = _collect_anons_and_parents(tree)
     taken = _all_taken_names(getattr(analyzer, "scopes", None))
+    chunk_locals = _chunk_local_decl_pos(tree)
     from models import Finding
 
+    candidates = []
+    for anon in anons:
+        parent = parents.get(id(anon))
+        # File-scope `foo = function()` is already named. Leave it.
+        if _is_chunk_func_def(anon, parent, parents):
+            continue
+        scope = _scope_for(anon, analyzer, parents)
+        fn_start, fn_end = _anon_span(source, anon)
+        if fn_start is None or fn_end is None:
+            size, start = 10**9, 10**9
+        else:
+            size, start = fn_end - fn_start, fn_start
+        candidates.append((size, start, anon, parent, scope))
+    # Smallest first: inner `_anon_1` before the outer that holds it.
+    candidates.sort()
+
     drafts = []
-    for call_info in getattr(analyzer, "calls", []) or []:
-        call = getattr(call_info, "node", None)
-        if call is None or _call_kind(call) is None:
-            continue
-        args = getattr(call, "args", None) or []
-        if not args or not isinstance(args[0], AnonymousFunction):
-            continue
-        parent = parents.get(id(call))
-        details = classify_pcall(
-            call,
+    for _size, _start, anon, parent, scope in candidates:
+        details = classify_anon(
+            anon,
             source,
-            getattr(call_info, "scope", None),
+            scope,
             parent,
-            set(taken),
+            taken,
             parents=parents,
+            chunk_locals=chunk_locals,
         )
-        drafts.append((call_info, parent, details))
+        drafts.append((anon, details))
 
-    finals = _finish_nested_hoists(drafts, source, taken, parents)
+    _splice_nested(drafts, source)
 
-    for (call_info, parent, _draft), details in zip(drafts, finals):
-        line = getattr(call_info, "line", 0) or 0
+    for anon, details in drafts:
+        line = _node_line(source, anon)
         src_line = ""
         if hasattr(analyzer, "_get_source_line"):
             src_line = analyzer._get_source_line(line) or ""
-        callee = details.get("callee") or "pcall"
+        callee = details.get("callee") or "function"
+        anon_name = details.get("anon_name") or "?"
+        caps = details.get("captures") or []
         if details.get("safe"):
-            helper = details.get("helper_name") or "?"
-            caps = details.get("captures") or []
             rewrite = details.get("rewrite_kind")
-            call_args = ", ".join([helper] + list(caps))
             if rewrite == "assign":
-                msg = f"{callee}(function() x = ... end) -> {callee}({helper}) then x = result"
-                suggestion = f"Hoist to {helper}; assign only on success"
-            else:
+                msg = f"function() x = ... end -> pcall({anon_name}) then x = result"
+                suggestion = f"Hoist to {anon_name}; assign only on success"
+            elif details.get("role") in ("pcall", "xpcall"):
+                call_args = ", ".join([anon_name] + list(caps))
                 msg = f"{callee}(function() ... end) -> {callee}({call_args})"
-                suggestion = f"Hoist to {helper}"
+                suggestion = f"Hoist to {anon_name}"
+            else:
+                msg = f"function() ... end -> {anon_name}"
+                suggestion = f"Hoist to {anon_name}"
             details["suggestion"] = suggestion
             analyzer.findings.append(Finding(
-                pattern_name="pcall_anon_hoist",
+                pattern_name="anon_hoist",
                 severity="GREEN",
                 line_num=line,
                 message=msg,
@@ -969,105 +1171,85 @@ def analyze_tree(analyzer) -> None:
             reason = details.get("skip_reason") or "unsafe"
             details["suggestion"] = f"Skipped: {reason}"
             analyzer.findings.append(Finding(
-                pattern_name="pcall_anon_skip",
+                pattern_name="anon_skip",
                 severity="RED",
                 line_num=line,
-                message=f"{callee}(function() ... end) skipped: {reason}",
+                message=f"function() ... end skipped: {reason}",
                 details=details,
                 source_line=src_line,
             ))
 
 
 def _span_contains(outer, inner) -> bool:
-    os_, oe = outer.get("replace_start"), outer.get("replace_end")
-    ins, ie = inner.get("replace_start"), inner.get("replace_end")
+    """Inner function sits inside outer. Use function span, not the callsite."""
+    os_, oe = outer.get("fn_start"), outer.get("fn_end")
+    ins, ie = inner.get("fn_start"), inner.get("fn_end")
     if None in (os_, oe, ins, ie):
         return False
     return os_ < ins and oe > ie
 
 
-def _rebuild_hoist_helper(details, source, func_src) -> bool:
-    helper_body = _replace_func_header(
+def _rebuild_hoist_anon(details, source, func_src) -> bool:
+    """Re-header and reindent after a splice into this body."""
+    anon_body = _replace_func_header(
         func_src,
-        details.get("helper_name"),
-        details.get("helper_params") or [],
+        details.get("anon_name"),
+        details.get("anon_params") or [],
     )
-    if helper_body is None:
+    if anon_body is None:
         return False
     indent = _line_indent(source, details["insert_char"])
-    details["helper_text"] = _reindent_helper(helper_body, indent, source) + "\n\n"
+    details["anon_text"] = _reindent_anon(anon_body, indent, source) + "\n\n"
     return True
 
 
 def _splice_inner(outer, inner, source) -> bool:
-    """Rewrite inner's original callsite text inside outer's helper body."""
-    old = source[inner["replace_start"]:inner["replace_end"]]
+    """Rewrite inner's original function text inside the outer anon func.
+
+    Keep a raw (pre-reindent) copy so a later sibling splice does not rebuild
+    from the original source and wipe this one.
+    """
+    fs, fe = inner.get("fn_start"), inner.get("fn_end")
+    if fs is None or fe is None:
+        return False
+    old = source[fs:fe]
     new = inner.get("replace_text") or ""
     if not old or not new:
         return False
-    ht = outer.get("helper_text") or ""
-    if old in ht:
-        outer["helper_text"] = ht.replace(old, new, 1)
-        return True
-    fs, fe = outer.get("fn_start"), outer.get("fn_end")
-    if fs is None or fe is None or outer.get("rewrite_kind") != "hoist":
+    raw = outer.get("raw_func")
+    if raw is None:
+        ofs, ofe = outer.get("fn_start"), outer.get("fn_end")
+        if ofs is None or ofe is None:
+            return False
+        raw = source[ofs:ofe]
+    if old not in raw:
         return False
-    func_src = source[fs:fe]
-    if old not in func_src:
-        return False
-    return _rebuild_hoist_helper(outer, source, func_src.replace(old, new, 1))
+    raw = raw.replace(old, new, 1)
+    outer["raw_func"] = raw
+    return _rebuild_hoist_anon(outer, source, raw)
 
 
-def _finish_nested_hoists(drafts, source, taken, parents):
-    """pcall inside pcall: name the inner first, paste its rewrite into the
-    outer helper, and do not also rewrite the inner callsite in the file.
-    """
-    finals = [d for _, _, d in drafts]
-    green_idxs = [i for i, d in enumerate(finals) if d.get("safe")]
-    green_idxs.sort(key=lambda i: (
-        (finals[i].get("replace_end") or 0) - (finals[i].get("replace_start") or 0),
-        finals[i].get("replace_start") or 0,
-    ))
-    done = {}
-    for i in green_idxs:
-        call_info, parent, _ = drafts[i]
-        details = classify_pcall(
-            getattr(call_info, "node", None),
-            source,
-            getattr(call_info, "scope", None),
-            parent,
-            taken,
-            parents=parents,
-        )
-        if details.get("safe"):
-            for j in green_idxs:
-                if j == i or j not in done or not done[j].get("safe"):
-                    continue
-                if not _span_contains(details, done[j]):
-                    continue
-                mid = False
-                for k in green_idxs:
-                    if k in (i, j) or k not in done or not done[k].get("safe"):
-                        continue
-                    if _span_contains(details, done[k]) and _span_contains(done[k], done[j]):
-                        mid = True
-                        break
-                if mid:
-                    continue
-                if not _splice_inner(details, done[j], source):
-                    details["safe"] = False
-                    details["skip_reason"] = "contains nested pcall"
-                    break
-        done[i] = details
-        finals[i] = details
-    for i in green_idxs:
-        d = finals[i]
-        if not d.get("safe"):
+def _splice_nested(drafts, source):
+    """Paste each child's rewrite into the nearest outer. Inner site stays as-is in the file."""
+    # drafts is already small-to-large.
+    greens = [d for *_, d in drafts if d.get("safe")]
+    done = []
+    for details in greens:
+        contained = [c for c in done if c.get("safe") and _span_contains(details, c)]
+        for child in contained:
+            if any(other is not child and _span_contains(other, child) for other in contained):
+                continue  # grandchild: already pasted into the child
+            if not _splice_inner(details, child, source):
+                details["safe"] = False
+                details["skip_reason"] = "contains nested function"
+                break
+        done.append(details)
+    # Child body is already the name inside the outer. Do not also replace it in the file.
+    for details in greens:
+        if not details.get("safe"):
             continue
         if any(
-            _span_contains(finals[k], d)
-            for k in green_idxs
-            if k != i and finals[k].get("safe")
+            other is not details and other.get("safe") and _span_contains(other, details)
+            for other in greens
         ):
-            d["absorb_callsite"] = True
-    return finals
+            details["absorb_callsite"] = True

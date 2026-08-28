@@ -41,8 +41,11 @@ class SourceEdit:
     # group leave this empty.
     is_enabler: bool = False
     # Same-position insertions apply high-seq first so they land later in the
-    # file (end-to-start apply). Used to keep foo_pcall_1 above foo_pcall_2.
+    # file (end-to-start apply). Used to keep foo_anon_1 above foo_anon_2.
     seq: int = 0
+    # Anon insert: (fn_start, fn_end). Other GREEN edits inside that span
+    # get folded into the anon func.
+    anon_meta: Optional[tuple] = None
 
 
 class ASTTransformer:
@@ -68,7 +71,7 @@ class ASTTransformer:
                        experimental: bool = False, fix_nil: bool = False,
                        remove_dead_code: bool = False,
                        cache_threshold: int = 4,
-                       fix_pcall: bool = False) -> Tuple[bool, str, int]:
+                       hoist_anon_funcs: bool = False) -> Tuple[bool, str, int]:
         """
         Transform a file based on findings.
         Returns (was_modified, new_content, edit_count).
@@ -84,7 +87,7 @@ class ASTTransformer:
         self.experimental = experimental
         self.fix_nil = fix_nil
         self.remove_dead_code = remove_dead_code
-        self.fix_pcall = fix_pcall
+        self.hoist_anon_funcs = bool(hoist_anon_funcs)
 
         # run analyzer with user-specified cache_threshold
         self.analyzer = ASTAnalyzer(cache_threshold=cache_threshold, experimental=experimental)
@@ -101,11 +104,12 @@ class ASTTransformer:
         if fix_debug:
             allowed_severities.add('DEBUG')
 
+        # Hoist is opt-in. Other GREEN still runs.
         fixable = [f for f in findings if f.severity in allowed_severities
-                   and f.pattern_name != 'pcall_anon_hoist']
+                   and f.pattern_name != 'anon_hoist']
 
-        if fix_pcall:
-            fixable.extend(f for f in findings if f.pattern_name == 'pcall_anon_hoist')
+        if self.hoist_anon_funcs:
+            fixable.extend(f for f in findings if f.pattern_name == 'anon_hoist')
         
         # add experimental fixes (string_concat_in_loop) if enabled
         # only add if not already included via fix_yellow
@@ -145,6 +149,8 @@ class ASTTransformer:
 
         if not self.edits:
             return False, self.source, 0
+
+        self._fold_inner_into_anon()
 
         edit_count = len(self.edits)
 
@@ -202,36 +208,40 @@ class ASTTransformer:
             self._edit_repeated_calls(finding)
         elif pattern == 'distance_to_comparison':
             self._edit_distance_to_comparison(finding)
-        elif pattern == 'pcall_anon_hoist':
-            if getattr(self, 'fix_pcall', False):
-                self._edit_pcall_anon(finding)
+        elif pattern == 'anon_hoist':
+            if getattr(self, 'hoist_anon_funcs', False):
+                self._edit_anon(finding)
 
 
     # Edit methods using AST positions
 
-    def _edit_pcall_anon(self, finding: Finding):
-        """Insert a hoisted helper and rewrite the pcall/xpcall callsite."""
+    def _edit_anon(self, finding: Finding):
+        """Insert the named func at file scope. Replace `function() ... end` with the name."""
         d = finding.details or {}
         if not d.get('safe'):
             return
-        helper_text = d.get('helper_text')
+        anon_text = d.get('anon_text')
         insert_char = d.get('insert_char')
         replace_start = d.get('replace_start')
         replace_end = d.get('replace_end')
         replace_text = d.get('replace_text')
-        if not helper_text or insert_char is None:
+        if not anon_text or insert_char is None:
             return
         gid = self._next_group_id
         self._next_group_id += 1
         absorbed = bool(d.get('absorb_callsite'))
+        fn_start = d.get('fn_start')
+        fn_end = d.get('fn_end')
+        meta = (fn_start, fn_end) if fn_start is not None and fn_end is not None else None
         if absorbed:
-            # Inner pcall already lives inside an outer helper. Only insert this helper.
+            # Already pasted into an outer. Only insert this named func.
             self.edits.append(SourceEdit(
                 start_char=insert_char,
                 end_char=insert_char,
-                replacement=helper_text,
+                replacement=anon_text,
                 priority=100,
                 seq=int(d.get('insert_seq') or 0),
+                anon_meta=meta,
             ))
             return
         if replace_start is None or replace_end is None or replace_text is None:
@@ -239,11 +249,12 @@ class ASTTransformer:
         self.edits.append(SourceEdit(
             start_char=insert_char,
             end_char=insert_char,
-            replacement=helper_text,
+            replacement=anon_text,
             priority=100,
             group_id=gid,
             is_enabler=True,
             seq=int(d.get('insert_seq') or 0),
+            anon_meta=meta,
         ))
         self.edits.append(SourceEdit(
             start_char=replace_start,
@@ -2325,6 +2336,47 @@ class ASTTransformer:
         
         return self._cached_indent_unit
 
+    def _fold_inner_into_anon(self):
+        """Same-pass `--fix` (table.insert etc.) sits inside the function we hoist.
+
+        Leave those replacements and they overlap the hoist; the hoist is dropped.
+        Patch them into the anon text, then drop the inner edits.
+        """
+        inserts = [e for e in self.edits if e.anon_meta]
+        if not inserts:
+            return
+        drop: Set[int] = set()
+        for ins in inserts:
+            fn_start, fn_end = ins.anon_meta
+            # Skip this hoist's own replace. Only fold other GREEN (table.insert etc.).
+            own = {
+                id(e) for e in self.edits
+                if e.group_id is not None
+                and e.group_id == ins.group_id
+                and e.start_char != e.end_char
+            }
+            inner = [
+                e for e in self.edits
+                if e.start_char != e.end_char
+                and e is not ins
+                and id(e) not in own
+                and fn_start <= e.start_char and e.end_char <= fn_end
+            ]
+            if not inner:
+                continue
+            # Do not rebuild from the original function. That wipes nested
+            # splices already in the anon text. Patch the text we have.
+            ht = ins.replacement
+            for e in sorted(inner, key=lambda x: -x.start_char):
+                old = self.source[e.start_char:e.end_char]
+                if old and old in ht:
+                    ht = ht.replace(old, e.replacement, 1)
+            ins.replacement = ht
+            for e in inner:
+                drop.add(id(e))
+        if drop:
+            self.edits = [e for e in self.edits if id(e) not in drop]
+
     def _apply_edits(self) -> str:
         """Apply all edits and return new source.
 
@@ -2415,9 +2467,9 @@ def transform_file(file_path: Path, backup: bool = True, dry_run: bool = False,
                    experimental: bool = False, fix_nil: bool = False,
                    remove_dead_code: bool = False,
                    cache_threshold: int = 4,
-                   fix_pcall: bool = False) -> Tuple[bool, str, int]:
+                   hoist_anon_funcs: bool = False) -> Tuple[bool, str, int]:
     """Convenience function to transform a file. Returns (modified, content, edit_count)."""
     transformer = ASTTransformer()
     return transformer.transform_file(file_path, backup, dry_run, fix_debug, fix_yellow, 
                                        experimental, fix_nil, remove_dead_code, cache_threshold,
-                                       fix_pcall=fix_pcall)
+                                       hoist_anon_funcs=hoist_anon_funcs)

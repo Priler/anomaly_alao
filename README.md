@@ -39,7 +39,7 @@ python stalker_lua_lint.py [path_to_mods] [options]
 --fix-debug        Comment out debug statements (log, printf, print, etc.)
 --fix-nil          Auto-fix safe nil access patterns (wrap with if-then guard)
 --remove-dead-code Remove 100% safe dead code (unreachable code, if false blocks)
---fix-pcall        Hoist pcall/xpcall(function() ... end) to a named local
+--hoist-anon-funcs Hoist function() ... end to a named local
 --cache-threshold  Minimum function call count to trigger caching (default: 4)
 
 --direct           Process scripts directly (no gamedata/scripts structure required)
@@ -102,7 +102,7 @@ _Notice a decreased frame time and AVG FPS increase. Keep in mind this was teste
 | Repeated `get_hud()` | `local hud = get_hud()` | Medium - cached singleton |
 | Repeated `:section()` | `local sec = obj:section()` | Medium - immutable property |
 | Repeated `:id()` | `local id = obj:id()` | Medium - immutable property |
-| `pcall(function() ... end)` | named `local function` + `pcall(name, captures...)` | High - no per-call closure alloc. Opt-in via `--fix-pcall` (not part of `--fix`) |
+| `function() ... end` | `local name = function` + use that name | High - no per-run closure alloc. Opt-in via `--hoist-anon-funcs` (not part of `--fix`) |
 
 
 ### YELLOW (may cause CTDs, fix with `--fix-yellow`)
@@ -123,7 +123,7 @@ Pay attention some of this fixes requires `--experimental` flag.
 | `vector()` in hot loop | Allocates new vector each iteration | Critical |
 | Constant conditions | `if true then` / `if false then` |
 | Unnecessary else | `if x then return end else ...` |
-| `pcall` anon skipped | Writes that are not a single `x = expr`, `xpcall` with captures, `...`, expression-context assigns |
+| `function() ... end` skipped | Enclosing locals the caller cannot take, writes that are not a single assign, outer `...` the caller cannot pass |
 
 
 ### DEBUG (comment out with `--fix-debug`)
@@ -224,10 +224,15 @@ This optimization reduces GC pressure from O(n²) to O(n) for string building.
 - Variable is initialized to `""` before the loop
 - Pattern is simple `var = var .. expr`
 
-## pcall hoist (`--fix-pcall`)
+## Anon hoist (`--hoist-anon-funcs`)
 
-`pcall(function() ... end)` allocates a new closure every time that line runs.  
-`--fix-pcall` hoists the anonymous function to a chunk-level `local function {caller}_pcall_{n}` and passes read-only captured locals as arguments.
+`function() ... end` allocates a new closure every time that line runs.  
+`--hoist-anon-funcs` hoists it to a chunk-level `local {caller}_anon_{n} = function(...)` and uses that name.
+
+If the caller can take extra args, read-only captured names become params on the anon func.  
+Everyone else (`table.sort`, `x or function()`, callbacks) keeps the same params. Enclosing locals or outer writes -> skip.
+
+File-scope `foo = function()` / `local foo = function()` is already named. Left alone.
 
 **Before:**
 ```lua
@@ -236,21 +241,34 @@ local function apply(info)
         info.desc:AdjustHeightToText()
     end)
 end
+
+local function sort_rows(data)
+    table.sort(data, function(a, b)
+        return (a and a[1] or 0) < (b and b[1] or 0)
+    end)
+end
 ```
 
 **After:**
 ```lua
-local function apply_pcall_1(info)
+local apply_anon_1 = function(info)
     info.desc:AdjustHeightToText()
 end
 local function apply(info)
-    pcall(apply_pcall_1, info)
+    pcall(apply_anon_1, info)
+end
+
+local sort_rows_anon_1 = function(a, b)
+    return (a and a[1] or 0) < (b and b[1] or 0)
+end
+local function sort_rows(data)
+    table.sort(data, sort_rows_anon_1)
 end
 ```
 
-A single-statement `pcall(function() x = expr end)` becomes `return expr` plus `if ok then x = v end`, so a failed pcall does not store the error string into `x`.
+A single-statement `function() x = expr end` passed to a caller that reports success/failure becomes `return expr` plus `if ok then x = v end`, so a failed call does not store the error string into `x`.
 
-Skipped (RED, no edit): writes that are not that single-assign shape, `xpcall` with leftover captures (Lua 5.1 cannot pass extra args), `...`, and assign-rewrites used as `if pcall(...)` expressions.
+Skipped (RED, no edit): writes that are not that single-assign shape, enclosing locals where the caller cannot take extra args, outer `...` the caller cannot pass, and assign-rewrites used as `if call(...)` expressions. Own `...` hoists. pcall can pass outer `...`.
 
 Not part of default `--fix`.
 

@@ -16,7 +16,7 @@ Options:
     --fix-nil          Fix safe nil access patterns (wrap with if-then guard)
     --remove-dead-code / --debloat
                        Remove 100% safe dead code (unreachable code, if false blocks)
-    --fix-pcall        Hoist pcall(function() ... end) to a named local. Not part of --fix.
+    --hoist-anon-funcs Hoist function() ... end to a named local. Not part of --fix.
     --cache-threshold N
                        Minimum function call count to trigger caching (default: 4)
                        Hot callbacks use N-1. Lower = more aggressive caching.
@@ -110,7 +110,7 @@ def analyze_file_worker(args_tuple):
 
 def transform_file_worker(args_tuple):
     """Worker function for parallel transform_file calls."""
-    script_path, backup, fix_debug, fix_yellow, experimental, fix_nil, remove_dead_code, cache_threshold, fix_pcall = args_tuple
+    script_path, backup, fix_debug, fix_yellow, experimental, fix_nil, remove_dead_code, cache_threshold, hoist_anon_funcs = args_tuple
     try:
         modified, _, edit_count = transform_file(
             script_path,
@@ -121,7 +121,7 @@ def transform_file_worker(args_tuple):
             fix_nil=fix_nil,
             remove_dead_code=remove_dead_code,
             cache_threshold=cache_threshold,
-            fix_pcall=fix_pcall,
+            hoist_anon_funcs=hoist_anon_funcs,
         )
         return (script_path, modified, edit_count, None)
     except Exception as e:
@@ -232,9 +232,10 @@ def main():
         help="Remove 100%% safe dead code (unreachable code after return, if false blocks, etc.)"
     )
     parser.add_argument(
-        "--fix-pcall",
+        "--hoist-anon-funcs",
         action="store_true",
-        help="Hoist pcall(function() ... end) to a named local. Not part of --fix."
+        dest="hoist_anon_funcs",
+        help="Hoist anonymous function() ... end to a named local. Not part of --fix."
     )
     parser.add_argument(
         "--experimental",
@@ -387,9 +388,9 @@ def main():
                 elif flag == 'fix-debug':
                     args.fix_debug = True
                     print(f"  Recovered: --fix-debug")
-                elif flag == 'fix-pcall':
-                    args.fix_pcall = True
-                    print(f"  Recovered: --fix-pcall")
+                elif flag == 'hoist-anon-funcs':
+                    args.hoist_anon_funcs = True
+                    print(f"  Recovered: --hoist-anon-funcs")
                 elif flag == 'experimental':
                     args.experimental = True
                     print(f"  Recovered: --experimental")
@@ -644,7 +645,7 @@ def main():
     # check if any fix flags are set
     fix_flags_set = (args.fix or args.fix_debug or args.fix_yellow or 
                      args.experimental or args.fix_nil or args.remove_dead_code
-                     or args.fix_pcall)
+                     or args.hoist_anon_funcs)
     
     # auto-backup on first fix run (safety mechanism)
     if fix_flags_set and not args.no_first_time_auto_backup and not args.backup_all_scripts:
@@ -825,7 +826,7 @@ def main():
     files_modified = 0
     total_edits = 0
 
-    if args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code or args.fix_pcall:
+    if args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code or args.hoist_anon_funcs:
         # proceed with fixes (auto-backup already handled before analysis)
         fix_msg = "Applying fixes"
         fix_types = []
@@ -841,8 +842,8 @@ def main():
             fix_types.append("NIL-GUARD")
         if args.remove_dead_code:
             fix_types.append("DEAD-CODE")
-        if args.fix_pcall:
-            fix_types.append("PCALL-HOIST")
+        if args.hoist_anon_funcs:
+            fix_types.append("ANON-HOIST")
         print(f"{fix_msg} ({', '.join(fix_types)}) with {num_workers} workers...")
 
         # prepare work items, skip files that already have .alao-bak (prevent double-fix)
@@ -856,7 +857,7 @@ def main():
                     print(f"  [SKIP] {script_path.name} - backup already exists")
             else:
                 work_items.append(
-                    (script_path, args.backup, args.fix_debug, args.fix_yellow, args.experimental, args.fix_nil, args.remove_dead_code, args.cache_threshold, args.fix_pcall)
+                    (script_path, args.backup, args.fix_debug, args.fix_yellow, args.experimental, args.fix_nil, args.remove_dead_code, args.cache_threshold, args.hoist_anon_funcs)
                 )
         
         if skipped_has_backup > 0 and not args.quiet:
@@ -963,7 +964,7 @@ def main():
                             fix_nil=args.fix_nil,
                             remove_dead_code=args.remove_dead_code,
                             cache_threshold=args.cache_threshold,
-                            fix_pcall=args.fix_pcall,
+                            hoist_anon_funcs=args.hoist_anon_funcs,
                         )
                         if modified:
                             files_modified += 1
@@ -999,7 +1000,7 @@ def main():
         print(f"Files skipped (timeout/error): {files_skipped}")
     if parse_errors > 0:
         print(f"Files with parse errors: {parse_errors}")
-    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code or args.fix_pcall):
+    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code or args.hoist_anon_funcs):
         print(f"Files modified: {files_modified}")
         print(f"Total edits applied: {total_edits}")
 
@@ -1019,9 +1020,9 @@ def main():
                            if f.pattern_name.startswith('dead_code_') and f.details.get('is_safe_to_remove'))
     unused_count = sum(1 for f in reporter.all_findings if f.pattern_name.startswith('unused_'))
 
-    pcall_hoist_count = sum(1 for f in reporter.all_findings if f.pattern_name == 'pcall_anon_hoist')
-    pcall_skip_count = sum(1 for f in reporter.all_findings if f.pattern_name == 'pcall_anon_skip')
-    pcall_count = pcall_hoist_count + pcall_skip_count
+    anon_hoist_count = sum(1 for f in reporter.all_findings if f.pattern_name == 'anon_hoist')
+    anon_skip_count = sum(1 for f in reporter.all_findings if f.pattern_name == 'anon_skip')
+    anon_count = anon_hoist_count + anon_skip_count
 
     findings_str = f"{green_count} GREEN (auto-fixable), {yellow_count} YELLOW (review), {red_count} RED (info)"
     if debug_count > 0:
@@ -1030,8 +1031,8 @@ def main():
         findings_str += f", {nil_count} NIL ({nil_fixable} fixable)"
     if dead_code_count > 0 or unused_count > 0:
         findings_str += f", {dead_code_count + unused_count} DEAD-CODE ({dead_code_fixable} removable)"
-    if pcall_count > 0:
-        findings_str += f", {pcall_count} PCALL ({pcall_hoist_count} hoistable)"
+    if anon_count > 0:
+        findings_str += f", {anon_count} ANON ({anon_hoist_count} hoistable)"
     print(f"\nFindings: {findings_str}")
 
     if green_count > 0 and not args.fix:
@@ -1046,9 +1047,9 @@ def main():
         print("Tip: Run with --fix-nil to add nil guards for safe nil access patterns")
     if dead_code_fixable > 0 and not args.remove_dead_code:
         print("Tip: Run with --remove-dead-code to remove safe unreachable code")
-    if pcall_hoist_count > 0 and not args.fix_pcall:
-        print("Tip: Run with --fix-pcall to hoist pcall(function() ... end) to a named local")
-    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code or args.fix_pcall):
+    if anon_hoist_count > 0 and not args.hoist_anon_funcs:
+        print("Tip: Run with --hoist-anon-funcs to hoist function() ... end to a named local")
+    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code or args.hoist_anon_funcs):
         print("Tip: Run with --revert to undo all changes using .alao-bak files")
 
 

@@ -1827,7 +1827,7 @@ class ASTAnalyzer:
         self._analyze_per_frame_callbacks()
         self._analyze_distance_to_comparisons()
         self._analyze_vector_allocations_in_loops()
-        self._analyze_pcall_anon()
+        self._analyze_anon_hoist()
 
     def _analyze_table_insert(self):
         """Find table.insert(t, v) that can be t[#t+1] = v."""
@@ -3160,9 +3160,9 @@ class ASTAnalyzer:
                 source_line=self._get_source_line(alloc.line),
             ))
 
-    def _analyze_pcall_anon(self):
-        """Hoist pcall/xpcall(function() ... end) to a named local (opt-in fix)."""
-        from pcall_hoist import analyze_tree
+    def _analyze_anon_hoist(self):
+        """Opt-in: lift function() ... end to a named local at file scope."""
+        from anon_hoist import analyze_tree
         analyze_tree(self)
 
     def _get_source_line(self, line_num: int) -> str:
