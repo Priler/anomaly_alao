@@ -748,6 +748,21 @@ class TestAnonHoist(unittest.TestCase):
         from luaparser import ast as lua_ast
         lua_ast.parse(out)
 
+    def test_chunk_local_cap_drops_local_keyword(self):
+        # Lua 5.1: 200 locals per chunk. Past the cap, hoist must not add more.
+        locs = "\n".join(f"local v{i} = {i}" for i in range(190))
+        src = (
+            locs + "\n"
+            "local function wrap()\n"
+            "\tpcall(function() return 1 end)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertIn("wrap_anon_1 = function", out)
+        self.assertNotIn("local wrap_anon_1 = function", out)
+        from luaparser import ast as lua_ast
+        lua_ast.parse(out)
+
 
 if __name__ == "__main__":
     unittest.main()

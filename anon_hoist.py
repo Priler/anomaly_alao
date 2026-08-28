@@ -14,6 +14,9 @@ When we can pass extra args (`pcall` only):
 Everyone else (`table.sort`, `x or function()`, callbacks): same params, no
 extra names. Captures or outer writes -> skip. Lua 5.1 `xpcall` is the same.
 
+Lua 5.1 allows 200 locals per function. The chunk is a function. If hoist
+would go over that, emit `name = function` (module/global) instead of `local`.
+
 Own `...` (this function's param) stays. Outer `...` is passed on pcall only
 (`pcall(fn, ...)`). Callers that cannot take extra args still skip.
 """
@@ -23,6 +26,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+# Lua 5.1 LUAI_MAXVARS is 200. Leave a few slots for later `--fix` chunk locals.
+_CHUNK_LOCAL_CAP = 190
 
 from luaparser.astnodes import (
     AnonymousFunction,
@@ -1096,6 +1102,23 @@ def _reindent_anon(text: str, indent: str, source: str) -> str:
     return "\n".join(out)
 
 
+def _drop_local_if_chunk_full(drafts, chunk_locals):
+    """Lua 5.1: 200 locals per function. Chunk locals plus `local foo_anon_N` count.
+
+    Over the cap, drop `local` so the name is a module/global assign.
+    """
+    n_new = sum(1 for _, d in drafts if d.get("safe"))
+    if len(chunk_locals) + n_new <= _CHUNK_LOCAL_CAP:
+        return
+    for _, d in drafts:
+        name = d.get("anon_name")
+        text = d.get("anon_text")
+        if d.get("safe") and name and text:
+            d["anon_text"] = text.replace(
+                f"local {name} = function", f"{name} = function", 1
+            )
+
+
 def analyze_tree(analyzer) -> None:
     """Collect, classify once (smallest first), splice inners into outers, report."""
     tree = getattr(analyzer, "_ast_tree", None)
@@ -1137,6 +1160,7 @@ def analyze_tree(analyzer) -> None:
         drafts.append((anon, details))
 
     _splice_nested(drafts, source)
+    _drop_local_if_chunk_full(drafts, chunk_locals)
 
     for anon, details in drafts:
         line = _node_line(source, anon)
