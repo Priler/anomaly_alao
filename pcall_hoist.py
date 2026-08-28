@@ -14,13 +14,17 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from luaparser.astnodes import (
     AnonymousFunction,
     Assign,
+    BinaryOp,
     Block,
-    Chunk,
+    Break,
     Call,
+    Chunk,
     Comment,
     Do,
     Dots,
     ElseIf,
+    FalseExpr,
+    Field,
     Forin,
     Fornum,
     Function,
@@ -28,12 +32,20 @@ from luaparser.astnodes import (
     If,
     Index,
     Invoke,
+    Label,
     LocalAssign,
     LocalFunction,
     Method,
     Name,
+    Nil,
+    Number,
     Repeat,
+    Return,
     SemiColon,
+    String,
+    Table,
+    TrueExpr,
+    UnaryOp,
     Varargs,
     While,
 )
@@ -101,10 +113,7 @@ def _pcall_call_span(source: str, call: Call) -> Tuple[Optional[int], Optional[i
     if i < len(source) and source[i] == ")":
         end = i + 1
     elif end > 0 and source[end - 1] != ")":
-        close = source.find(")", end - 1)
-        if close < 0:
-            return None, None
-        end = close + 1
+        return None, None
     return start, end
 
 
@@ -197,14 +206,6 @@ def _func_display_name(node) -> Optional[str]:
         meth = _name_id(getattr(node, "name", None)) or "method"
         return f"{src}_{meth}"
     return None
-
-
-def _enclosing_locals(scope) -> Set[str]:
-    names: Set[str] = set()
-    while scope is not None and getattr(scope, "scope_type", None) != "global":
-        names.update(getattr(scope, "locals", ()) or ())
-        scope = getattr(scope, "parent", None)
-    return names
 
 
 def _assigned_func_name(func_node, parents) -> Optional[str]:
@@ -316,9 +317,10 @@ class AnonUse:
     writes: Set[str] = field(default_factory=set)
     uses_dots: bool = False
     has_goto: bool = False
+    unknown: bool = False
 
 
-def _analyze_anon(anon: AnonymousFunction, enclosing: Set[str]) -> AnonUse:
+def _analyze_anon(anon: AnonymousFunction) -> AnonUse:
     use = AnonUse()
     stack: List[Set[str]] = [set()]
 
@@ -357,16 +359,22 @@ def _analyze_anon(anon: AnonymousFunction, enclosing: Set[str]) -> AnonUse:
                 return
             if is_inner(name):
                 return
-            if name in enclosing:
-                if as_assign_target:
-                    use.writes.add(name)
-                else:
-                    use.reads.add(name)
+            if as_assign_target:
+                use.writes.add(name)
+            else:
+                use.reads.add(name)
             return
         if isinstance(node, Index):
             walk(node.value)
             if _is_bracket_idx(node.idx):
                 walk(node.idx)
+            return
+        if isinstance(node, Field):
+            walk(getattr(node, "value", None))
+            # `{ foo = 1 }` key is a field name, not a variable. `[foo]` is.
+            tok = getattr(node, "first_token", None)
+            if tok is not None and str(tok) != "None" and str(tok).find("'['") >= 0:
+                walk(getattr(node, "key", None))
             return
         if isinstance(node, Invoke):
             walk(getattr(node, "source", None))
@@ -451,8 +459,15 @@ def _analyze_anon(anon: AnonymousFunction, enclosing: Set[str]) -> AnonUse:
             for item in node:
                 walk(item)
             return
-        for child in _iter_children(node):
-            walk(child)
+        if isinstance(node, (
+            Block, Call, Return, Table, BinaryOp, UnaryOp, Chunk,
+            Number, String, Nil, TrueExpr, FalseExpr, Break,
+            Comment, SemiColon, Label,
+        )):
+            for child in _iter_children(node):
+                walk(child)
+            return
+        use.unknown = True
 
     walk(getattr(anon, "body", None))
     return use
@@ -602,8 +617,10 @@ def classify_pcall(
         details["skip_reason"] = "missing first_token/last_token"
         return details
 
-    enclosing = _enclosing_locals(scope)
-    use = _analyze_anon(anon, enclosing)
+    use = _analyze_anon(anon)
+    if use.unknown:
+        details["skip_reason"] = "anonymous function has unknown syntax"
+        return details
     if use.uses_dots:
         details["skip_reason"] = "anonymous function uses ..."
         return details

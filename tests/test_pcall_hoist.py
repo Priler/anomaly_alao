@@ -69,13 +69,13 @@ class TestPcallHoist(unittest.TestCase):
             "end\n"
         )
         out = transform(src)
-        self.assertIn("local function foo_pcall_1()", out)
-        self.assertIn("\tpcall(foo_pcall_1)", out)
+        self.assertIn("local function foo_pcall_1(level)", out)
+        self.assertIn("\tpcall(foo_pcall_1, level)", out)
         self.assertNotIn("pcall(function()", out)
         helpers = out.split("local function foo()")[0]
         self.assertEqual(
             helpers,
-            "local function foo_pcall_1()\n"
+            "local function foo_pcall_1(level)\n"
             "\tlevel.enable_input()\n"
             "end\n\n",
         )
@@ -92,6 +92,18 @@ class TestPcallHoist(unittest.TestCase):
         self.assertIn("local function apply_description_visibility_pcall_1(info)", out)
         self.assertIn("pcall(apply_description_visibility_pcall_1, info)", out)
         self.assertIn("info.desc:AdjustHeightToText()", out)
+
+    def test_table_record_key_is_not_a_capture(self):
+        src = (
+            "local function foo()\n"
+            "\tlocal bar = 1\n"
+            "\tpcall(function() return { bar = 1 } end)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertIn("local function foo_pcall_1()", out)
+        self.assertIn("pcall(foo_pcall_1)", out)
+        self.assertNotIn("foo_pcall_1(bar)", out)
 
     def test_field_write_is_capture_read(self):
         src = (
@@ -115,9 +127,9 @@ class TestPcallHoist(unittest.TestCase):
             "end\n"
         )
         out = transform(src)
-        self.assertIn("local function active_slot_pcall_1()", out)
+        self.assertIn("local function active_slot_pcall_1(db)", out)
         self.assertIn("return db.actor:active_slot()", out)
-        self.assertIn("local _ok, _slot = pcall(active_slot_pcall_1)", out)
+        self.assertIn("local _ok, _slot = pcall(active_slot_pcall_1, db)", out)
         self.assertIn("if _ok then slot = _slot end", out)
         self.assertNotIn("pcall(function()", out)
 
@@ -130,7 +142,7 @@ class TestPcallHoist(unittest.TestCase):
             "end\n"
         )
         out = transform(src)
-        self.assertIn("local ok, _slot = pcall(wrap_pcall_1)", out)
+        self.assertIn("local ok, _slot = pcall(wrap_pcall_1, db)", out)
         self.assertIn("if ok then slot = _slot end", out)
 
     def test_skip_two_unpack(self):
@@ -241,9 +253,9 @@ class TestPcallHoist(unittest.TestCase):
         )
         out = transform(src)
         self.assertIn("local function foo_pcall_1()", out)
-        self.assertIn("local function foo_pcall_2()", out)
+        self.assertIn("local function foo_pcall_2(pcall)", out)
         self.assertIn("pcall(foo_pcall_1)", out)
-        self.assertIn("pcall(foo_pcall_2)", out)
+        self.assertIn("pcall(foo_pcall_2, pcall)", out)
         self.assertNotIn("pcall(function()", out)
         self.assertLess(out.find("foo_pcall_1"), out.find("foo_pcall_2"))
         green = _findings(src, "pcall_anon_hoist")
@@ -276,10 +288,21 @@ class TestPcallHoist(unittest.TestCase):
         out = transform(src, fix_pcall=False)
         self.assertEqual(out, src)
 
-    def test_xpcall_no_capture_hoist(self):
+    def test_xpcall_with_free_name_skipped(self):
         src = (
             "local function foo()\n"
             "\txpcall(function() level.enable_input() end, print)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertEqual(out, src)
+        red = _findings(src, "pcall_anon_skip")
+        self.assertTrue(any("xpcall" in (f.details.get("skip_reason") or "") for f in red))
+
+    def test_xpcall_no_free_name_hoist(self):
+        src = (
+            "local function foo()\n"
+            "\txpcall(function() return 1 end, print)\n"
             "end\n"
         )
         out = transform(src)
@@ -304,8 +327,8 @@ class TestPcallHoist(unittest.TestCase):
             "end\n"
         )
         out = transform(src)
-        self.assertTrue(out.startswith("local function chunk_pcall_1()"), out)
-        self.assertIn("pcall(chunk_pcall_1)", out)
+        self.assertTrue(out.startswith("local function chunk_pcall_1(profile_timer)"), out)
+        self.assertIn("pcall(chunk_pcall_1, profile_timer)", out)
         self.assertNotIn("local function", out.split("do\n", 1)[1])
 
     def test_assign_anon_inside_named_hoists_to_chunk(self):
@@ -330,7 +353,7 @@ class TestPcallHoist(unittest.TestCase):
             "end\n"
         )
         out = transform(src)
-        self.assertTrue(out.startswith("local function foo_pcall_1()"), out)
+        self.assertTrue(out.startswith("local function foo_pcall_1(level)"), out)
         self.assertNotIn("local function foo_pcall_1", out.split("do\n", 1)[1])
 
     def test_finding_message_matches_alao_style(self):
