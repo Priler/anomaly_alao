@@ -434,17 +434,23 @@ class ASTAnalyzer:
         # cleared per-run so a re-used analyzer can't see a stale tree
         self._ast_tree: Optional[Node] = None
 
-    def analyze_file(self, file_path: Path) -> List[Finding]:
-        """Analyze a Lua file and return findings."""
+    def analyze_file(self, file_path: Path, source: Optional[str] = None) -> List[Finding]:
+        """Analyze a Lua file and return findings.
+
+        `source` skips the disk read (hoist-then-fix re-analyze).
+        """
         self.reset()
         self.file_path = file_path
 
-        try:
-            encoding = detect_file_encoding(file_path)
-            self.source = file_path.read_text(encoding=encoding)
-            self._file_encoding = encoding
-        except Exception:
-            return []
+        if source is not None:
+            self.source = source
+        else:
+            try:
+                encoding = detect_file_encoding(file_path)
+                self.source = file_path.read_text(encoding=encoding)
+                self._file_encoding = encoding
+            except Exception:
+                return []
 
         self.source_lines = self.source.splitlines()
 

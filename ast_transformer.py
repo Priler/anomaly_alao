@@ -96,6 +96,25 @@ class ASTTransformer:
         # get source from analyzer and compute line offsets
         self.source = self.analyzer.source
         self._compute_line_offsets()
+        original = self.source
+        hoist_edits = 0
+
+        # Hoist first, then re-analyze, then the rest of --fix. Same-pass
+        # --fix offsets still point at the old `function() ... end`.
+        if self.hoist_anon_funcs:
+            for finding in findings:
+                if finding.pattern_name == 'anon_hoist':
+                    self._generate_edits(finding)
+            if self.edits:
+                hoisted = self._apply_edits()
+                if hoisted != self.source:
+                    hoist_edits = len(self.edits)
+                    findings = self.analyzer.analyze_file(file_path, source=hoisted)
+                    self.source = self.analyzer.source
+                    self._compute_line_offsets()
+            self.edits = []
+            self._next_group_id = 1
+            self.hoist_anon_funcs = False
 
         # filter to fixable severities
         allowed_severities = {'GREEN'}
@@ -104,12 +123,8 @@ class ASTTransformer:
         if fix_debug:
             allowed_severities.add('DEBUG')
 
-        # Hoist is opt-in. Other GREEN still runs.
         fixable = [f for f in findings if f.severity in allowed_severities
                    and f.pattern_name != 'anon_hoist']
-
-        if self.hoist_anon_funcs:
-            fixable.extend(f for f in findings if f.pattern_name == 'anon_hoist')
         
         # add experimental fixes (string_concat_in_loop) if enabled
         # only add if not already included via fix_yellow
@@ -140,25 +155,13 @@ class ASTTransformer:
                 if df.line_num not in existing_lines:
                     fixable.append(df)
 
-        if not fixable:
-            return False, self.source, 0
+        if fixable:
+            for finding in fixable:
+                self._generate_edits(finding)
 
-        # generate edits for each finding
-        for finding in fixable:
-            self._generate_edits(finding)
-
-        if not self.edits:
-            return False, self.source, 0
-
-        self._fold_inner_into_anon()
-
-        edit_count = len(self.edits)
-
-        # apply edits
-        new_content = self._apply_edits()
-
-        if new_content == self.source:
-            return False, self.source, 0
+        new_content = self._apply_edits() if self.edits else self.source
+        if new_content == original:
+            return False, original, 0
 
         if not dry_run:
             if backup:
@@ -169,7 +172,7 @@ class ASTTransformer:
 
             file_path.write_text(new_content, encoding=getattr(self.analyzer, '_file_encoding', 'latin-1'))
 
-        return True, new_content, edit_count
+        return True, new_content, len(self.edits) + hoist_edits
 
     def _generate_edits(self, finding: Finding):
         """Generate source edits for a finding."""
@@ -2335,47 +2338,6 @@ class ASTTransformer:
             self._cached_indent_unit = '\t'
         
         return self._cached_indent_unit
-
-    def _fold_inner_into_anon(self):
-        """Same-pass `--fix` (table.insert etc.) sits inside the function we hoist.
-
-        Leave those replacements and they overlap the hoist; the hoist is dropped.
-        Patch them into the anon text, then drop the inner edits.
-        """
-        inserts = [e for e in self.edits if e.anon_meta]
-        if not inserts:
-            return
-        drop: Set[int] = set()
-        for ins in inserts:
-            fn_start, fn_end = ins.anon_meta
-            # Skip this hoist's own replace. Only fold other GREEN (table.insert etc.).
-            own = {
-                id(e) for e in self.edits
-                if e.group_id is not None
-                and e.group_id == ins.group_id
-                and e.start_char != e.end_char
-            }
-            inner = [
-                e for e in self.edits
-                if e.start_char != e.end_char
-                and e is not ins
-                and id(e) not in own
-                and fn_start <= e.start_char and e.end_char <= fn_end
-            ]
-            if not inner:
-                continue
-            # Do not rebuild from the original function. That wipes nested
-            # splices already in the anon text. Patch the text we have.
-            ht = ins.replacement
-            for e in sorted(inner, key=lambda x: -x.start_char):
-                old = self.source[e.start_char:e.end_char]
-                if old and old in ht:
-                    ht = ht.replace(old, e.replacement, 1)
-            ins.replacement = ht
-            for e in inner:
-                drop.add(id(e))
-        if drop:
-            self.edits = [e for e in self.edits if id(e) not in drop]
 
     def _apply_edits(self) -> str:
         """Apply all edits and return new source.

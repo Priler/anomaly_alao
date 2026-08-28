@@ -723,6 +723,31 @@ class TestAnonHoist(unittest.TestCase):
         self.assertNotIn("a.add = function", out)
         self.assertNotIn("table.insert", out)
 
+    def test_fix_cache_decl_inside_hoisted_function(self):
+        # --fix rewrites math.min -> mmin and inserts `local mmin = math.min`
+        # at the original function start. That insert sits inside the hoist
+        # replace span and used to be dropped; hoisted body then called nil.
+        src = (
+            "local function wrap()\n"
+            "\ta.add = function(self, x)\n"
+            "\t\tlocal a = math.min(x, 1)\n"
+            "\t\tlocal b = math.min(x, 2)\n"
+            "\t\tlocal c = math.min(x, 3)\n"
+            "\t\tlocal d = math.min(x, 4)\n"
+            "\tend\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertIn("local a_add_anon_1 = function(self, x)", out)
+        self.assertIn("local mmin = math.min", out)
+        self.assertIn("mmin(x, 1)", out)
+        self.assertNotIn("math.min(x, 1)", out)
+        hoist, _, rest = out.partition("a.add = a_add_anon_1")
+        self.assertIn("local mmin = math.min", hoist)
+        self.assertNotIn("local mmin = math.min", rest)
+        from luaparser import ast as lua_ast
+        lua_ast.parse(out)
+
 
 if __name__ == "__main__":
     unittest.main()
