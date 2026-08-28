@@ -1057,7 +1057,11 @@ def _indent_unit(source: str) -> str:
 
 
 def _reindent_anon(text: str, indent: str, source: str) -> str:
-    """`local name = function` / `end` at insert indent; body one step in."""
+    """`local name = function` / `end` at insert indent; body one step in.
+
+    `#include` in a DXML [[...]] must stay at column 0 (xrXMLParser: str[0]=='#').
+    If reindent pads a line to spaces-then-#, strip the lead.
+    """
     lines = text.split("\n")
     while lines and lines[-1] == "":
         lines.pop()
@@ -1097,7 +1101,10 @@ def _reindent_anon(text: str, indent: str, source: str) -> str:
             out.append("")
             continue
         body = m[len(common):] if common and m.startswith(common) else m.lstrip(" \t")
-        out.append(indent + unit + body)
+        line = indent + unit + body
+        if line.lstrip(" \t")[:1] == "#":
+            line = line.lstrip(" \t")
+        out.append(line)
     out.append(last)
     return "\n".join(out)
 

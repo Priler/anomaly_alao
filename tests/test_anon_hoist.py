@@ -748,6 +748,27 @@ class TestAnonHoist(unittest.TestCase):
         from luaparser import ast as lua_ast
         lua_ast.parse(out)
 
+    def test_reindent_keeps_long_string_include(self):
+        # xrXMLParser: #include only if str[0] == '#'. Reindent pads the
+        # [[...]] body; a line that is then spaces-then-# gets the lead stripped.
+        src = (
+            "function on_xml_read()\n"
+            "\tRegisterScriptCallback(\"on_xml_read\", function(name, xml)\n"
+            "\t\tlocal inc =\n"
+            "[[\n"
+            "#include \"ui\\map_spots_paw.xml\"\n"
+            "]]\n"
+            "\t\txml:insertFromXMLString(inc)\n"
+            "\tend)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertIn("\n#include \"ui\\map_spots_paw.xml\"\n", out)
+        self.assertNotIn("    #include", out)
+        self.assertNotIn("\t#include", out)
+        from luaparser import ast as lua_ast
+        lua_ast.parse(out)
+
     def test_chunk_local_cap_drops_local_keyword(self):
         # Lua 5.1: 200 locals per chunk. Past the cap, hoist must not add more.
         locs = "\n".join(f"local v{i} = {i}" for i in range(190))
