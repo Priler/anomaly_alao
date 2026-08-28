@@ -64,7 +64,8 @@ class ASTTransformer:
                        fix_debug: bool = False, fix_yellow: bool = False,
                        experimental: bool = False, fix_nil: bool = False,
                        remove_dead_code: bool = False,
-                       cache_threshold: int = 4) -> Tuple[bool, str, int]:
+                       cache_threshold: int = 4,
+                       fix_pcall: bool = False) -> Tuple[bool, str, int]:
         """
         Transform a file based on findings.
         Returns (was_modified, new_content, edit_count).
@@ -80,6 +81,7 @@ class ASTTransformer:
         self.experimental = experimental
         self.fix_nil = fix_nil
         self.remove_dead_code = remove_dead_code
+        self.fix_pcall = fix_pcall
 
         # run analyzer with user-specified cache_threshold
         self.analyzer = ASTAnalyzer(cache_threshold=cache_threshold, experimental=experimental)
@@ -96,7 +98,11 @@ class ASTTransformer:
         if fix_debug:
             allowed_severities.add('DEBUG')
 
-        fixable = [f for f in findings if f.severity in allowed_severities]
+        fixable = [f for f in findings if f.severity in allowed_severities
+                   and f.pattern_name != 'pcall_anon_hoist']
+
+        if fix_pcall:
+            fixable.extend(f for f in findings if f.pattern_name == 'pcall_anon_hoist')
         
         # add experimental fixes (string_concat_in_loop) if enabled
         # only add if not already included via fix_yellow
@@ -193,9 +199,44 @@ class ASTTransformer:
             self._edit_repeated_calls(finding)
         elif pattern == 'distance_to_comparison':
             self._edit_distance_to_comparison(finding)
+        elif pattern == 'pcall_anon_hoist':
+            if getattr(self, 'fix_pcall', False):
+                self._edit_pcall_anon(finding)
 
 
     # Edit methods using AST positions
+
+    def _edit_pcall_anon(self, finding: Finding):
+        """Insert a hoisted helper and rewrite the pcall/xpcall callsite."""
+        d = finding.details or {}
+        if not d.get('safe'):
+            return
+        helper_text = d.get('helper_text')
+        insert_char = d.get('insert_char')
+        replace_start = d.get('replace_start')
+        replace_end = d.get('replace_end')
+        replace_text = d.get('replace_text')
+        if (not helper_text or insert_char is None
+                or replace_start is None or replace_end is None
+                or replace_text is None):
+            return
+        gid = self._next_group_id
+        self._next_group_id += 1
+        self.edits.append(SourceEdit(
+            start_char=insert_char,
+            end_char=insert_char,
+            replacement=helper_text,
+            priority=100,
+            group_id=gid,
+            is_enabler=True,
+        ))
+        self.edits.append(SourceEdit(
+            start_char=replace_start,
+            end_char=replace_end,
+            replacement=replace_text,
+            priority=50,
+            group_id=gid,
+        ))
 
     def _edit_table_insert(self, finding: Finding):
         """Convert table.insert(t, v) to t[#t+1] = v."""
@@ -2358,8 +2399,10 @@ def transform_file(file_path: Path, backup: bool = True, dry_run: bool = False,
                    fix_debug: bool = False, fix_yellow: bool = False,
                    experimental: bool = False, fix_nil: bool = False,
                    remove_dead_code: bool = False,
-                   cache_threshold: int = 4) -> Tuple[bool, str, int]:
+                   cache_threshold: int = 4,
+                   fix_pcall: bool = False) -> Tuple[bool, str, int]:
     """Convenience function to transform a file. Returns (modified, content, edit_count)."""
     transformer = ASTTransformer()
     return transformer.transform_file(file_path, backup, dry_run, fix_debug, fix_yellow, 
-                                       experimental, fix_nil, remove_dead_code, cache_threshold)
+                                       experimental, fix_nil, remove_dead_code, cache_threshold,
+                                       fix_pcall=fix_pcall)

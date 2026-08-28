@@ -39,6 +39,7 @@ python stalker_lua_lint.py [path_to_mods] [options]
 --fix-debug        Comment out debug statements (log, printf, print, etc.)
 --fix-nil          Auto-fix safe nil access patterns (wrap with if-then guard)
 --remove-dead-code Remove 100% safe dead code (unreachable code, if false blocks)
+--fix-pcall        Hoist pcall/xpcall(function() ... end) to a named local
 --cache-threshold  Minimum function call count to trigger caching (default: 4)
 
 --direct           Process scripts directly (no gamedata/scripts structure required)
@@ -101,6 +102,7 @@ _Notice a decreased frame time and AVG FPS increase. Keep in mind this was teste
 | Repeated `get_hud()` | `local hud = get_hud()` | Medium - cached singleton |
 | Repeated `:section()` | `local sec = obj:section()` | Medium - immutable property |
 | Repeated `:id()` | `local id = obj:id()` | Medium - immutable property |
+| `pcall(function() ... end)` | named `local function` + `pcall(name, captures...)` | High - no per-call closure alloc. Opt-in via `--fix-pcall` (not part of `--fix`) |
 
 
 ### YELLOW (may cause CTDs, fix with `--fix-yellow`)
@@ -121,6 +123,7 @@ Pay attention some of this fixes requires `--experimental` flag.
 | `vector()` in hot loop | Allocates new vector each iteration | Critical |
 | Constant conditions | `if true then` / `if false then` |
 | Unnecessary else | `if x then return end else ...` |
+| `pcall` anon skipped | Writes that are not a single `x = expr`, `xpcall` with captures, `...`, expression-context assigns |
 
 
 ### DEBUG (comment out with `--fix-debug`)
@@ -220,6 +223,36 @@ This optimization reduces GC pressure from O(n²) to O(n) for string building.
 **Safety:** Only applied when:
 - Variable is initialized to `""` before the loop
 - Pattern is simple `var = var .. expr`
+
+## pcall hoist (`--fix-pcall`)
+
+`pcall(function() ... end)` allocates a new closure every time that line runs.  
+`--fix-pcall` hoists the anonymous function to a chunk-level `local function {caller}_pcall_{n}` and passes read-only captured locals as arguments.
+
+**Before:**
+```lua
+local function apply(info)
+    pcall(function()
+        info.desc:AdjustHeightToText()
+    end)
+end
+```
+
+**After:**
+```lua
+local function apply_pcall_1(info)
+    info.desc:AdjustHeightToText()
+end
+local function apply(info)
+    pcall(apply_pcall_1, info)
+end
+```
+
+A single-statement `pcall(function() x = expr end)` becomes `return expr` plus `if ok then x = v end`, so a failed pcall does not store the error string into `x`.
+
+Skipped (RED, no edit): writes that are not that single-assign shape, `xpcall` with leftover captures (Lua 5.1 cannot pass extra args), `...`, and assign-rewrites used as `if pcall(...)` expressions.
+
+Not part of default `--fix`.
 
 ## Nil checks performance impact
 
