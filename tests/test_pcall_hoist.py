@@ -230,6 +230,22 @@ class TestPcallHoist(unittest.TestCase):
         self.assertEqual(len(green), 1)
         self.assertNotIn("sm", green[0].details.get("captures") or [])
 
+    def test_multiline_return_does_not_double_end(self):
+        src = (
+            "local function sort_by_dots(parts, sorter, table)\n"
+            "\tlocal ok = pcall(function() return table.sort(\n"
+            "\t\tparts,\n"
+            "\t\tfunction(a, b) return sorter(a, b) end\n"
+            "\t) end)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertIn("pcall(sort_by_dots_pcall_1,", out)
+        self.assertNotIn("pcall(function()", out)
+        self.assertNotRegex(out, r"\) end\nend")
+        from luaparser import ast as lua_ast
+        lua_ast.parse(out)
+
     def test_fornum_without_step_hoists(self):
         src = (
             "local function remove_spots(obj_id)\n"

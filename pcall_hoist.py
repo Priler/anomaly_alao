@@ -54,6 +54,7 @@ from luaparser.astnodes import (
 _TOKEN_START = re.compile(r"\[@\d+,(\d+):\d+='")
 _TOKEN_END = re.compile(r"\[@\d+,\d+:(\d+)='")
 _FUNC_HEADER = re.compile(r"^function\s*\([^)]*\)", re.DOTALL)
+_TRAIL_END = re.compile(r"^(.*?)(?<![A-Za-z0-9_])end\s*$")
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LUA_KEYWORDS = frozenset({
     "and", "break", "do", "else", "elseif", "end", "false", "for",
@@ -847,10 +848,15 @@ def _reindent_helper(helper: str, indent: str, source: str) -> str:
         return indent + lines[0].lstrip(" \t")
     first = indent + lines[0].lstrip(" \t")
     last = indent + "end"
-    middle = lines[1:-1]
-    # last line should be `end`; if the original was `... end` on the body
-    # line, keep that line as middle and still emit our `end`.
-    if lines[-1].lstrip(" \t") != "end":
+    # Last line is `end`, `) end`, or `return x end`. Strip that end; we emit ours.
+    # Do not keep `) end` and also append `end` (packer multi-line return).
+    trail = _TRAIL_END.match(lines[-1].rstrip())
+    if trail:
+        middle = list(lines[1:-1])
+        rest = trail.group(1).rstrip()
+        if rest:
+            middle.append(rest)
+    else:
         middle = lines[1:]
     out = [first]
     nonempty = [m for m in middle if m.strip()]
