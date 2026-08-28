@@ -15,6 +15,7 @@ from luaparser.astnodes import (
     AnonymousFunction,
     Assign,
     Block,
+    Chunk,
     Call,
     Comment,
     Do,
@@ -206,19 +207,67 @@ def _enclosing_locals(scope) -> Set[str]:
     return names
 
 
-def _named_func_scopes(scope) -> List[Any]:
-    """Innermost-first function scopes that have a usable name + node."""
-    out = []
-    while scope is not None:
-        if getattr(scope, "scope_type", None) == "function":
-            node = getattr(scope, "node", None)
-            name = getattr(scope, "name", "") or ""
-            if node is not None and (
-                not name.startswith("<") or isinstance(node, Method)
-            ):
-                out.append(scope)
-        scope = getattr(scope, "parent", None)
-    return out
+def _assigned_func_name(func_node, parents) -> Optional[str]:
+    """Name of `foo = function()` / `local foo = function()` wrapping func_node."""
+    if not parents or func_node is None:
+        return None
+    p = parents.get(id(func_node))
+    if not isinstance(p, (Assign, LocalAssign)):
+        return None
+    targets = getattr(p, "targets", None) or []
+    if not targets:
+        return None
+    t = targets[0]
+    name = _name_id(t)
+    if name:
+        return name
+    if isinstance(t, Index):
+        parts = []
+        cur = t
+        while isinstance(cur, Index):
+            idx = _name_id(cur.idx)
+            if idx:
+                parts.append(idx)
+            cur = cur.value
+        base = _name_id(cur)
+        if base:
+            parts.append(base)
+        parts.reverse()
+        return "_".join(parts) if parts else None
+    return None
+
+
+def _caller_name(scope, parents) -> str:
+    """Innermost function: `foo = function()` wins over an outer `local function`."""
+    s = scope
+    while s is not None:
+        if getattr(s, "scope_type", None) == "function":
+            node = getattr(s, "node", None)
+            assigned = _assigned_func_name(node, parents)
+            if assigned:
+                return assigned
+            display = _func_display_name(node) if node is not None else None
+            name = display or getattr(s, "name", "") or ""
+            if name and not str(name).startswith("<"):
+                return name
+        s = getattr(s, "parent", None)
+    return "_chunk"
+
+
+def _chunk_stmt(node, parents):
+    """Top-level chunk statement that contains `node`."""
+    if not parents or node is None:
+        return None
+    prev = node
+    cur = parents.get(id(node))
+    while cur is not None:
+        if isinstance(cur, Block):
+            gp = parents.get(id(cur))
+            if isinstance(gp, Chunk):
+                return prev
+        prev = cur
+        cur = parents.get(id(cur))
+    return None
 
 
 def _all_taken_names(scopes) -> Set[str]:
@@ -231,6 +280,11 @@ def _all_taken_names(scopes) -> Set[str]:
         if name and not str(name).startswith("<"):
             taken.add(sanitize_ident(str(name)))
     return taken
+
+
+def _helper_seq(name: str) -> int:
+    m = re.search(r"_pcall_(\d+)$", name or "")
+    return int(m.group(1)) if m else 0
 
 
 def pick_helper_name(caller: str, taken: Set[str]) -> Optional[str]:
@@ -520,6 +574,7 @@ def classify_pcall(
     parent,
     taken: Set[str],
     scopes=None,
+    parents=None,
 ) -> Dict[str, Any]:
     """Return a details dict for a Finding. `safe` True means GREEN hoist."""
     details: Dict[str, Any] = {"safe": False}
@@ -561,26 +616,16 @@ def classify_pcall(
         details["skip_reason"] = "anonymous function has unusable params"
         return details
 
-    named = _named_func_scopes(scope)
-    caller = "_chunk"
-    if named:
-        display = _func_display_name(named[0].node) or named[0].name
-        caller = display or "_chunk"
-
-    insert_node = named[-1].node if named else None
-    if insert_node is not None:
-        ins_start, _ = node_span(insert_node)
-        if ins_start is None:
-            details["skip_reason"] = "cannot find chunk-level insert point"
-            return details
-        insert_char = _line_start(source, ins_start)
-    else:
-        insert_char = _line_start(source, call_start)
-
-    helper_name = pick_helper_name(caller, taken)
-    if helper_name is None:
-        details["skip_reason"] = "cannot allocate helper name"
+    caller = _caller_name(scope, parents)
+    insert_node = _chunk_stmt(call, parents)
+    if insert_node is None:
+        details["skip_reason"] = "cannot find chunk-level insert point"
         return details
+    ins_start, _ = node_span(insert_node)
+    if ins_start is None:
+        details["skip_reason"] = "cannot find chunk-level insert point"
+        return details
+    insert_char = _line_start(source, ins_start)
 
     ctx_kind, n_targets, ok_name, assign_node = _assign_context(call, parent)
     extra = args[1:]
@@ -614,6 +659,17 @@ def classify_pcall(
         if kind == "xpcall" and leftover:
             details["skip_reason"] = "xpcall cannot take extra args (Lua 5.1)"
             return details
+        a_start = a_end = None
+        if ctx_kind != "stmt":
+            a_start, a_end = node_span(assign_node)
+            if a_start is None or a_end is None:
+                details["skip_reason"] = "cannot slice parent assign"
+                return details
+
+        helper_name = pick_helper_name(caller, taken)
+        if helper_name is None:
+            details["skip_reason"] = "cannot allocate helper name"
+            return details
 
         helper_params = list(orig_params) + leftover
         indent = _line_indent(source, insert_char)
@@ -643,10 +699,6 @@ def classify_pcall(
         else:
             # keep existing ok target; widen to two results
             ok_temp = ok_name or pick_temp("_ok", taken)
-            a_start, a_end = node_span(assign_node)
-            if a_start is None or a_end is None:
-                details["skip_reason"] = "cannot slice parent assign"
-                return details
             local_kw = "local " if isinstance(assign_node, LocalAssign) else ""
             replace_start, replace_end = a_start, a_end
             replace_text = (
@@ -658,9 +710,13 @@ def classify_pcall(
             "safe": True,
             "rewrite_kind": "assign",
             "helper_name": helper_name,
+            "helper_params": helper_params,
             "captures": leftover,
             "helper_text": helper_text,
+            "fn_start": fn_start,
+            "fn_end": fn_end,
             "insert_char": insert_char,
+            "insert_seq": _helper_seq(helper_name),
             "replace_start": replace_start,
             "replace_end": replace_end,
             "replace_text": replace_text,
@@ -673,6 +729,11 @@ def classify_pcall(
     if kind == "xpcall" and captures:
         details["skip_reason"] = "xpcall cannot take extra args (Lua 5.1)"
         details["captures"] = captures
+        return details
+
+    helper_name = pick_helper_name(caller, taken)
+    if helper_name is None:
+        details["skip_reason"] = "cannot allocate helper name"
         return details
 
     func_src = source[fn_start:fn_end]
@@ -697,9 +758,13 @@ def classify_pcall(
         "safe": True,
         "rewrite_kind": "hoist",
         "helper_name": helper_name,
+        "helper_params": helper_params,
         "captures": captures,
         "helper_text": helper_text,
+        "fn_start": fn_start,
+        "fn_end": fn_end,
         "insert_char": insert_char,
+        "insert_seq": _helper_seq(helper_name),
         "replace_start": call_start,
         "replace_end": call_end,
         "replace_text": replace_text,
@@ -768,6 +833,7 @@ def analyze_tree(analyzer) -> None:
     taken = _all_taken_names(getattr(analyzer, "scopes", None))
     from models import Finding
 
+    drafts = []
     for call_info in getattr(analyzer, "calls", []) or []:
         call = getattr(call_info, "node", None)
         if call is None or _call_kind(call) is None:
@@ -775,20 +841,24 @@ def analyze_tree(analyzer) -> None:
         args = getattr(call, "args", None) or []
         if not args or not isinstance(args[0], AnonymousFunction):
             continue
-
         parent = parents.get(id(call))
         details = classify_pcall(
             call,
             source,
             getattr(call_info, "scope", None),
             parent,
-            taken,
+            set(taken),
+            parents=parents,
         )
+        drafts.append((call_info, parent, details))
+
+    finals = _finish_nested_hoists(drafts, source, taken, parents)
+
+    for (call_info, parent, _draft), details in zip(drafts, finals):
         line = getattr(call_info, "line", 0) or 0
         src_line = ""
         if hasattr(analyzer, "_get_source_line"):
             src_line = analyzer._get_source_line(line) or ""
-
         callee = details.get("callee") or "pcall"
         if details.get("safe"):
             helper = details.get("helper_name") or "?"
@@ -821,3 +891,96 @@ def analyze_tree(analyzer) -> None:
                 details=details,
                 source_line=src_line,
             ))
+
+
+def _span_contains(outer, inner) -> bool:
+    os_, oe = outer.get("replace_start"), outer.get("replace_end")
+    ins, ie = inner.get("replace_start"), inner.get("replace_end")
+    if None in (os_, oe, ins, ie):
+        return False
+    return os_ < ins and oe > ie
+
+
+def _rebuild_hoist_helper(details, source, func_src) -> bool:
+    helper_body = _replace_func_header(
+        func_src,
+        details.get("helper_name"),
+        details.get("helper_params") or [],
+    )
+    if helper_body is None:
+        return False
+    indent = _line_indent(source, details["insert_char"])
+    details["helper_text"] = _reindent_helper(helper_body, indent, source) + "\n\n"
+    return True
+
+
+def _splice_inner(outer, inner, source) -> bool:
+    """Rewrite inner's original callsite text inside outer's helper body."""
+    old = source[inner["replace_start"]:inner["replace_end"]]
+    new = inner.get("replace_text") or ""
+    if not old or not new:
+        return False
+    ht = outer.get("helper_text") or ""
+    if old in ht:
+        outer["helper_text"] = ht.replace(old, new, 1)
+        return True
+    fs, fe = outer.get("fn_start"), outer.get("fn_end")
+    if fs is None or fe is None or outer.get("rewrite_kind") != "hoist":
+        return False
+    func_src = source[fs:fe]
+    if old not in func_src:
+        return False
+    return _rebuild_hoist_helper(outer, source, func_src.replace(old, new, 1))
+
+
+def _finish_nested_hoists(drafts, source, taken, parents):
+    """Innermost-first names; splice inner rewrite into outer helper; absorb inner callsite."""
+    finals = [d for _, _, d in drafts]
+    green_idxs = [i for i, d in enumerate(finals) if d.get("safe")]
+    green_idxs.sort(key=lambda i: (
+        (finals[i].get("replace_end") or 0) - (finals[i].get("replace_start") or 0),
+        finals[i].get("replace_start") or 0,
+    ))
+    done = {}
+    for i in green_idxs:
+        call_info, parent, _ = drafts[i]
+        details = classify_pcall(
+            getattr(call_info, "node", None),
+            source,
+            getattr(call_info, "scope", None),
+            parent,
+            taken,
+            parents=parents,
+        )
+        if details.get("safe"):
+            for j in green_idxs:
+                if j == i or j not in done or not done[j].get("safe"):
+                    continue
+                if not _span_contains(details, done[j]):
+                    continue
+                mid = False
+                for k in green_idxs:
+                    if k in (i, j) or k not in done or not done[k].get("safe"):
+                        continue
+                    if _span_contains(details, done[k]) and _span_contains(done[k], done[j]):
+                        mid = True
+                        break
+                if mid:
+                    continue
+                if not _splice_inner(details, done[j], source):
+                    details["safe"] = False
+                    details["skip_reason"] = "contains nested pcall"
+                    break
+        done[i] = details
+        finals[i] = details
+    for i in green_idxs:
+        d = finals[i]
+        if not d.get("safe"):
+            continue
+        if any(
+            _span_contains(finals[k], d)
+            for k in green_idxs
+            if k != i and finals[k].get("safe")
+        ):
+            d["absorb_callsite"] = True
+    return finals

@@ -355,7 +355,8 @@ class Reporter:
         skip_keys = {
             'node', 'nodes', 'ast_node', 'call_node',
             # pcall hoist internals - used by the transformer, not reports
-            'helper_text', 'insert_char', 'replace_start', 'replace_end',
+            'helper_text', 'insert_char', 'insert_seq', 'replace_start', 'replace_end',
+            'fn_start', 'fn_end', 'helper_params', 'absorb_callsite',
             'replace_text', 'safe',
         }
         
@@ -513,7 +514,8 @@ def format_details(details: dict) -> str:
 
     skip_keys = {
         'node', 'nodes', 'ast_node', 'call_node',
-        'helper_text', 'insert_char', 'replace_start', 'replace_end',
+        'helper_text', 'insert_char', 'insert_seq', 'replace_start', 'replace_end',
+        'fn_start', 'fn_end', 'helper_params', 'absorb_callsite',
         'replace_text', 'safe',
     }
 

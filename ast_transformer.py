@@ -40,6 +40,9 @@ class SourceEdit:
     # if its group has no surviving replacements. Replacements in the same
     # group leave this empty.
     is_enabler: bool = False
+    # Same-position insertions apply high-seq first so they land later in the
+    # file (end-to-start apply). Used to keep foo_pcall_1 above foo_pcall_2.
+    seq: int = 0
 
 
 class ASTTransformer:
@@ -216,12 +219,23 @@ class ASTTransformer:
         replace_start = d.get('replace_start')
         replace_end = d.get('replace_end')
         replace_text = d.get('replace_text')
-        if (not helper_text or insert_char is None
-                or replace_start is None or replace_end is None
-                or replace_text is None):
+        if not helper_text or insert_char is None:
             return
         gid = self._next_group_id
         self._next_group_id += 1
+        absorbed = bool(d.get('absorb_callsite'))
+        if absorbed:
+            # Body already spliced into an outer helper. Insert only.
+            self.edits.append(SourceEdit(
+                start_char=insert_char,
+                end_char=insert_char,
+                replacement=helper_text,
+                priority=100,
+                seq=int(d.get('insert_seq') or 0),
+            ))
+            return
+        if replace_start is None or replace_end is None or replace_text is None:
+            return
         self.edits.append(SourceEdit(
             start_char=insert_char,
             end_char=insert_char,
@@ -229,6 +243,7 @@ class ASTTransformer:
             priority=100,
             group_id=gid,
             is_enabler=True,
+            seq=int(d.get('insert_seq') or 0),
         ))
         self.edits.append(SourceEdit(
             start_char=replace_start,
@@ -2388,7 +2403,7 @@ class ASTTransformer:
 
         # Apply end-to-start so earlier positions stay valid.
         admitted = admitted_repl + admitted_ins
-        admitted.sort(key=lambda e: -e.start_char)
+        admitted.sort(key=lambda e: (-e.start_char, -e.seq))
         result = self.source
         for edit in admitted:
             result = result[:edit.start_char] + edit.replacement + result[edit.end_char:]

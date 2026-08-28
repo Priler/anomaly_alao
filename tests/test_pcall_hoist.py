@@ -229,6 +229,43 @@ class TestPcallHoist(unittest.TestCase):
         self.assertIn("local function foo_pcall_2(b)", out)
         self.assertIn("pcall(foo_pcall_1, a)", out)
         self.assertIn("pcall(foo_pcall_2, b)", out)
+        self.assertLess(out.find("foo_pcall_1"), out.find("foo_pcall_2"))
+
+    def test_nested_pcall_hoists_both(self):
+        src = (
+            "local function foo()\n"
+            "\tpcall(function()\n"
+            "\t\tpcall(function() return 1 end)\n"
+            "\tend)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertIn("local function foo_pcall_1()", out)
+        self.assertIn("local function foo_pcall_2()", out)
+        self.assertIn("pcall(foo_pcall_1)", out)
+        self.assertIn("pcall(foo_pcall_2)", out)
+        self.assertNotIn("pcall(function()", out)
+        self.assertLess(out.find("foo_pcall_1"), out.find("foo_pcall_2"))
+        green = _findings(src, "pcall_anon_hoist")
+        self.assertEqual(len(green), 2)
+
+    def test_skip_does_not_eat_helper_number(self):
+        src = (
+            "local function foo(a, b)\n"
+            "\tlocal x = 0\n"
+            "\tpcall(function() return a end)\n"
+            "\tpcall(function()\n"
+            "\t\tx = 1\n"
+            "\t\tx = 2\n"
+            "\tend)\n"
+            "\tpcall(function() return b end)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertIn("local function foo_pcall_1(a)", out)
+        self.assertIn("local function foo_pcall_2(b)", out)
+        self.assertNotIn("foo_pcall_3", out)
+        self.assertIn("pcall(function()", out)
 
     def test_flag_off_does_not_rewrite(self):
         src = (
@@ -249,6 +286,53 @@ class TestPcallHoist(unittest.TestCase):
         self.assertIn("local function foo_pcall_1()", out)
         self.assertIn("xpcall(foo_pcall_1, print)", out)
 
+    def test_assign_anon_hoists_above_assign(self):
+        src = (
+            "foo = function(x)\n"
+            "\tpcall(function() return x + 1 end)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertTrue(out.startswith("local function foo_pcall_1(x)"), out)
+        self.assertIn("pcall(foo_pcall_1, x)", out)
+        self.assertNotIn("local function", out.split("foo = function", 1)[1])
+
+    def test_do_block_hoists_above_do(self):
+        src = (
+            "do\n"
+            "\tlocal ok, t = pcall(function() return profile_timer() end)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertTrue(out.startswith("local function chunk_pcall_1()"), out)
+        self.assertIn("pcall(chunk_pcall_1)", out)
+        self.assertNotIn("local function", out.split("do\n", 1)[1])
+
+    def test_assign_anon_inside_named_hoists_to_chunk(self):
+        src = (
+            "local function outer()\n"
+            "\tfoo = function(x)\n"
+            "\t\tpcall(function() return x end)\n"
+            "\tend\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertTrue(out.startswith("local function foo_pcall_1(x)"), out)
+        after_outer = out.split("local function outer()", 1)[1]
+        self.assertNotIn("local function foo_pcall_1", after_outer)
+
+    def test_local_func_inside_do_hoists_above_do(self):
+        src = (
+            "do\n"
+            "\tlocal function foo()\n"
+            "\t\tpcall(function() level.enable_input() end)\n"
+            "\tend\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertTrue(out.startswith("local function foo_pcall_1()"), out)
+        self.assertNotIn("local function foo_pcall_1", out.split("do\n", 1)[1])
+
     def test_finding_message_matches_alao_style(self):
         src = (
             "local function apply(info)\n"
@@ -265,6 +349,7 @@ class TestPcallHoist(unittest.TestCase):
         shown = format_details(f.details)
         self.assertNotIn("helper_text", shown)
         self.assertNotIn("insert_char", shown)
+        self.assertNotIn("insert_seq", shown)
         self.assertIn("helper_name", shown)
         self.assertEqual(get_performance_impact("pcall_anon_hoist"), "high")
         self.assertEqual(get_performance_impact("pcall_anon_skip"), "high")
