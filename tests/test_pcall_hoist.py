@@ -214,6 +214,7 @@ class TestPcallHoist(unittest.TestCase):
         self.assertTrue(any("writes" in (f.details.get("skip_reason") or "") for f in red))
 
     def test_local_bind_is_not_a_write(self):
+        # `local sm =` is a new name inside the pcall, not a write of outer sm.
         src = (
             "local function wrap()\n"
             "\tpcall(function()\n"
@@ -231,6 +232,7 @@ class TestPcallHoist(unittest.TestCase):
         self.assertNotIn("sm", green[0].details.get("captures") or [])
 
     def test_multiline_return_does_not_double_end(self):
+        # Packer style: `return foo(\n...\n) end` must not get a second end.
         src = (
             "local function sort_by_dots(parts, sorter, table)\n"
             "\tlocal ok = pcall(function() return table.sort(\n"
@@ -247,6 +249,7 @@ class TestPcallHoist(unittest.TestCase):
         lua_ast.parse(out)
 
     def test_fornum_without_step_hoists(self):
+        # `for i = 1, #t` has no step. Parser leaves a raw 1. That is not unknown syntax.
         src = (
             "local function remove_spots(obj_id)\n"
             "\tpcall(function()\n"

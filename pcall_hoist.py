@@ -1,8 +1,15 @@
-"""Classify and rewrite pcall/xpcall(function() ... end) closures.
+"""Hoist pcall/xpcall(function() ... end) to a named local at file scope.
 
-Hoists the anonymous function to a chunk-level local so the callsite
-does not allocate a closure every run. Fail closed: anything we cannot
-prove equivalent is reported RED and left alone.
+Every run of `pcall(function() ... end)` builds a new closure. We lift the
+body to `local function foo_pcall_1(...)` once, then call that.
+
+Only when we can prove the rewrite does the same thing. Anything else stays
+as-is and is reported RED.
+
+Two rewrites:
+- read-only body: hoist as-is, pass used names as extra args
+- one `x = expr` to an outer name: helper returns expr; assign x only if pcall
+  succeeded (a failed pcall must not store the error string in x)
 """
 
 from __future__ import annotations
@@ -92,10 +99,10 @@ def node_span(node) -> Tuple[Optional[int], Optional[int]]:
 
 
 def _pcall_call_span(source: str, call: Call) -> Tuple[Optional[int], Optional[int]]:
-    """Span of `pcall(...)` / `xpcall(...)`, including the callee name.
+    """Span of the whole `pcall(...)` / `xpcall(...)`, name included.
 
-    luaparser often sets Call.first_token to `(`. Replacing from there and
-    writing `pcall(...)` again yields `pcallpcall(...)`.
+    Parser often starts the call at `(`. Replacing from there writes
+    `pcall(...)` again and you get `pcallpcall(...)`.
     """
     start, end = node_span(call)
     if end is None:
@@ -167,6 +174,7 @@ def _name_id(node) -> Optional[str]:
 
 
 def _is_bracket_idx(idx) -> bool:
+    """True for `t[foo]`. Dot `t.foo` has no token on the key."""
     tok = getattr(idx, "first_token", None) if idx is not None else None
     return tok is not None and str(tok) != "None"
 
@@ -257,7 +265,10 @@ def _caller_name(scope, parents) -> str:
 
 
 def _chunk_stmt(node, parents):
-    """Top-level chunk statement that contains `node`."""
+    """File-scope statement that owns `node` (`local function`, `foo =`, `do`).
+
+    Helpers go above this, not inside the hot function.
+    """
     if not parents or node is None:
         return None
     prev = node
@@ -321,6 +332,7 @@ class AnonUse:
     unknown: bool = False
 
 
+# Parser leftover, not Lua: `for i = 1, #t` has no step, so step is a raw 1.
 _LEAF = (int, float, str, bool, bytes)
 _WALK_OK = (
     Block, Call, Return, Table, BinaryOp, UnaryOp, Chunk,
@@ -330,10 +342,13 @@ _WALK_OK = (
 
 
 def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None, on_unknown=None):
-    """Scope walk. Callers subscribe to one event. Bindings stay here.
+    """Walk the body. Track locals. Callers listen for one kind of event.
 
-    `local x = rhs`: walk rhs, then bind x. x is not a free write.
-    `x = rhs`: free write of x, then walk rhs.
+    Bind vs write:
+    - `local x = rhs`: new x inside the pcall. Walk rhs, then bind x.
+    - `x = rhs`: write of an outer x. Then walk rhs.
+
+    Free name = used here, not bound in this function (or a nested one).
     """
     stack: List[Set[str]] = [set()]
 
@@ -369,12 +384,14 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
                 on_free(name, as_write)
             return
         if isinstance(node, Index):
+            # t.foo reads t. t[foo] also reads foo.
             walk(node.value)
             if _is_bracket_idx(node.idx):
                 walk(node.idx)
             return
         if isinstance(node, Field):
             walk(getattr(node, "value", None))
+            # { foo = 1 } key is a field name, not a variable. { [foo] = 1 } is.
             tok = getattr(node, "first_token", None)
             if tok is not None and str(tok) != "None" and str(tok).find("'['") >= 0:
                 walk(getattr(node, "key", None))
@@ -385,6 +402,7 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
                 walk(a)
             return
         if isinstance(node, LocalAssign):
+            # Must be before Assign: local-assign is a kind of assign in the parser.
             for v in getattr(node, "values", None) or []:
                 walk(v)
             for t in getattr(node, "targets", None) or []:
@@ -467,6 +485,7 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
                 walk(child)
             return
         if on_unknown:
+            # Node type we do not handle. Fail closed.
             on_unknown()
 
     for arg in getattr(anon, "args", None) or []:
@@ -477,10 +496,11 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
 
 
 def _analyze_anon(anon: AnonymousFunction) -> AnonUse:
-    """
-    1. syntax: unknown node / ... / goto
-    2. writes: `x =` only. `local x =` binds x, not a write
-    3. reads: free names used as values
+    """Three passes over the same body.
+
+    1. Can we read this? Unknown syntax, `...`, or goto -> stop.
+    2. Writes: outer `x =`. `local x =` does not count.
+    3. Reads: names used as values (captures).
     """
     use = AnonUse()
 
@@ -520,9 +540,8 @@ def _anon_params(anon: AnonymousFunction) -> Optional[List[str]]:
 
 
 def _single_capture_assign(anon: AnonymousFunction, writes: Set[str]) -> Optional[Tuple[str, Any]]:
-    """Body is exactly one `name = expr` whose name is a captured write."""
+    """Exactly one `x = expr` that writes an outer x. Not `local x =`."""
     stmts = _real_stmts(getattr(anon, "body", None))
-    # LocalAssign subclasses Assign. Sole `local x = expr` is not a capture write.
     if len(stmts) != 1 or type(stmts[0]) is not Assign:
         return None
     assign = stmts[0]
@@ -626,7 +645,12 @@ def classify_pcall(
     scopes=None,
     parents=None,
 ) -> Dict[str, Any]:
-    """Return a details dict for a Finding. `safe` True means GREEN hoist."""
+    """Decide hoist vs skip. `safe` True means we will rewrite.
+
+    Skip if: not bare pcall/xpcall, first arg not `function()`, `...`, goto,
+    unknown syntax, xpcall with extra names (Lua 5.1 cannot pass them),
+    outer writes that are not a single `x = expr`, or we cannot slice tokens.
+    """
     details: Dict[str, Any] = {"safe": False}
 
     kind = _call_kind(call)
@@ -690,6 +714,7 @@ def classify_pcall(
     reads = set(use.reads) - writes
     assign_info = _single_capture_assign(anon, writes) if writes else None
 
+    # Outer write only if the whole body is `x = expr`. Else leave it.
     if writes and assign_info is None:
         details["skip_reason"] = "writes captured locals (not a single x = expr)"
         details["writes"] = sorted(writes)
@@ -709,6 +734,7 @@ def classify_pcall(
             return details
         leftover = sorted(reads)
         if kind == "xpcall" and leftover:
+            # xpcall(fn, err) only. No room to pass captures.
             details["skip_reason"] = "xpcall cannot take extra args (Lua 5.1)"
             return details
         a_start = a_end = None
@@ -741,6 +767,7 @@ def classify_pcall(
 
         stmt_indent = _line_indent(source, call_start)
         val_name = pick_temp(f"_{assigned}", taken)
+        # Helper returns the expr. Copy into x only when pcall succeeded.
         if ctx_kind == "stmt":
             ok_temp = pick_temp("_ok", taken)
             replace_start, replace_end = call_start, call_end
@@ -776,7 +803,7 @@ def classify_pcall(
         })
         return details
 
-    # read-only hoist
+    # No outer writes: lift the body, pass names it reads.
     captures = sorted(reads)
     if kind == "xpcall" and captures:
         details["skip_reason"] = "xpcall cannot take extra args (Lua 5.1)"
@@ -848,8 +875,9 @@ def _reindent_helper(helper: str, indent: str, source: str) -> str:
         return indent + lines[0].lstrip(" \t")
     first = indent + lines[0].lstrip(" \t")
     last = indent + "end"
-    # Last line is `end`, `) end`, or `return x end`. Strip that end; we emit ours.
-    # Do not keep `) end` and also append `end` (packer multi-line return).
+    # Last line already has `end` (`end`, `) end`, `return x end`). Keep the
+    # rest of that line. Always write one `end` of our own. Packer writes
+    # `return foo(\n...\n) end`; keeping `) end` and adding `end` breaks parse.
     trail = _TRAIL_END.match(lines[-1].rstrip())
     if trail:
         middle = list(lines[1:-1])
@@ -991,7 +1019,9 @@ def _splice_inner(outer, inner, source) -> bool:
 
 
 def _finish_nested_hoists(drafts, source, taken, parents):
-    """Innermost-first names; splice inner rewrite into outer helper; absorb inner callsite."""
+    """pcall inside pcall: name the inner first, paste its rewrite into the
+    outer helper, and do not also rewrite the inner callsite in the file.
+    """
     finals = [d for _, _, d in drafts]
     green_idxs = [i for i, d in enumerate(finals) if d.get("safe")]
     green_idxs.sort(key=lambda i: (

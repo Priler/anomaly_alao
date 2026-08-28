@@ -225,7 +225,7 @@ class ASTTransformer:
         self._next_group_id += 1
         absorbed = bool(d.get('absorb_callsite'))
         if absorbed:
-            # Body already spliced into an outer helper. Insert only.
+            # Inner pcall already lives inside an outer helper. Only insert this helper.
             self.edits.append(SourceEdit(
                 start_char=insert_char,
                 end_char=insert_char,

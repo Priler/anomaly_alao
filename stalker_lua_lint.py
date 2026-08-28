@@ -16,7 +16,7 @@ Options:
     --fix-nil          Fix safe nil access patterns (wrap with if-then guard)
     --remove-dead-code / --debloat
                        Remove 100% safe dead code (unreachable code, if false blocks)
-    --fix-pcall        Hoist pcall/xpcall(function() ... end) to a named local
+    --fix-pcall        Hoist pcall(function() ... end) to a named local. Not part of --fix.
     --cache-threshold N
                        Minimum function call count to trigger caching (default: 4)
                        Hot callbacks use N-1. Lower = more aggressive caching.
@@ -234,7 +234,7 @@ def main():
     parser.add_argument(
         "--fix-pcall",
         action="store_true",
-        help="Hoist pcall/xpcall(function() ... end) to a named chunk-level local"
+        help="Hoist pcall(function() ... end) to a named local. Not part of --fix."
     )
     parser.add_argument(
         "--experimental",
