@@ -213,6 +213,41 @@ class TestPcallHoist(unittest.TestCase):
         red = _findings(src, "pcall_anon_skip")
         self.assertTrue(any("writes" in (f.details.get("skip_reason") or "") for f in red))
 
+    def test_local_bind_is_not_a_write(self):
+        src = (
+            "local function wrap()\n"
+            "\tpcall(function()\n"
+            "\t\tlocal sm = surge_manager.get_surge_manager()\n"
+            "\t\tif sm then sm.started = false end\n"
+            "\tend)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertIn("local function wrap_pcall_1(surge_manager)", out)
+        self.assertIn("pcall(wrap_pcall_1, surge_manager)", out)
+        self.assertNotIn("pcall(function()", out)
+        green = _findings(src, "pcall_anon_hoist")
+        self.assertEqual(len(green), 1)
+        self.assertNotIn("sm", green[0].details.get("captures") or [])
+
+    def test_fornum_without_step_hoists(self):
+        src = (
+            "local function remove_spots(obj_id)\n"
+            "\tpcall(function()\n"
+            "\t\tlocal spots = (tft_path and tft_path.dots) or {}\n"
+            "\t\tfor i = 1, #spots do\n"
+            "\t\t\tlocal spot = spots[i]\n"
+            "\t\t\tlevel.map_remove_object_spot(obj_id, spot)\n"
+            "\t\tend\n"
+            "\tend)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertIn("pcall(remove_spots_pcall_1,", out)
+        self.assertNotIn("pcall(function()", out)
+        red = _findings(src, "pcall_anon_skip")
+        self.assertEqual(red, [])
+
     def test_helper_above_outermost_named(self):
         src = (
             "local function outer()\n"

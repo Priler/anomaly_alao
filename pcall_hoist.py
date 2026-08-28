@@ -320,8 +320,20 @@ class AnonUse:
     unknown: bool = False
 
 
-def _analyze_anon(anon: AnonymousFunction) -> AnonUse:
-    use = AnonUse()
+_LEAF = (int, float, str, bool, bytes)
+_WALK_OK = (
+    Block, Call, Return, Table, BinaryOp, UnaryOp, Chunk,
+    Number, String, Nil, TrueExpr, FalseExpr, Break,
+    Comment, SemiColon, Label,
+)
+
+
+def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None, on_unknown=None):
+    """Scope walk. Callers subscribe to one event. Bindings stay here.
+
+    `local x = rhs`: walk rhs, then bind x. x is not a free write.
+    `x = rhs`: free write of x, then walk rhs.
+    """
     stack: List[Set[str]] = [set()]
 
     def add_inner(name: Optional[str]):
@@ -331,38 +343,29 @@ def _analyze_anon(anon: AnonymousFunction) -> AnonUse:
     def is_inner(name: str) -> bool:
         return any(name in layer for layer in stack)
 
-    def push():
-        stack.append(set())
+    def dots():
+        if on_dots:
+            on_dots()
 
-    def pop():
-        stack.pop()
-
-    for arg in getattr(anon, "args", None) or []:
-        if isinstance(arg, (Dots, Varargs)):
-            use.uses_dots = True
-        add_inner(_name_id(arg))
-
-    def walk(node, as_assign_target: bool = False):
-        if node is None:
+    def walk(node, as_write: bool = False):
+        if node is None or isinstance(node, _LEAF):
             return
         if isinstance(node, (Dots, Varargs)):
-            use.uses_dots = True
+            dots()
             return
         if isinstance(node, Goto):
-            use.has_goto = True
+            if on_goto:
+                on_goto()
             return
         if isinstance(node, Name):
             name = node.id
-            if not name or name == "...":
-                if name == "...":
-                    use.uses_dots = True
+            if name == "...":
+                dots()
                 return
-            if is_inner(name):
+            if not name or is_inner(name):
                 return
-            if as_assign_target:
-                use.writes.add(name)
-            else:
-                use.reads.add(name)
+            if on_free:
+                on_free(name, as_write)
             return
         if isinstance(node, Index):
             walk(node.value)
@@ -371,7 +374,6 @@ def _analyze_anon(anon: AnonymousFunction) -> AnonUse:
             return
         if isinstance(node, Field):
             walk(getattr(node, "value", None))
-            # `{ foo = 1 }` key is a field name, not a variable. `[foo]` is.
             tok = getattr(node, "first_token", None)
             if tok is not None and str(tok) != "None" and str(tok).find("'['") >= 0:
                 walk(getattr(node, "key", None))
@@ -381,95 +383,126 @@ def _analyze_anon(anon: AnonymousFunction) -> AnonUse:
             for a in getattr(node, "args", None) or []:
                 walk(a)
             return
-        if isinstance(node, Assign):
-            for t in getattr(node, "targets", None) or []:
-                if isinstance(t, Name):
-                    walk(t, as_assign_target=True)
-                else:
-                    walk(t)
-            for v in getattr(node, "values", None) or []:
-                walk(v)
-            return
         if isinstance(node, LocalAssign):
             for v in getattr(node, "values", None) or []:
                 walk(v)
             for t in getattr(node, "targets", None) or []:
                 add_inner(_name_id(t))
             return
+        if isinstance(node, Assign):
+            for t in getattr(node, "targets", None) or []:
+                if isinstance(t, Name):
+                    walk(t, as_write=True)
+                else:
+                    walk(t)
+            for v in getattr(node, "values", None) or []:
+                walk(v)
+            return
         if isinstance(node, (Function, LocalFunction, Method, AnonymousFunction)):
             if isinstance(node, LocalFunction):
                 add_inner(_name_id(node.name))
-            push()
+            stack.append(set())
             if isinstance(node, Method):
                 add_inner("self")
             for arg in getattr(node, "args", None) or []:
                 if isinstance(arg, (Dots, Varargs)):
-                    use.uses_dots = True
+                    dots()
                 add_inner(_name_id(arg))
             walk(getattr(node, "body", None))
-            pop()
+            stack.pop()
             return
         if isinstance(node, Fornum):
             walk(getattr(node, "start", None))
             walk(getattr(node, "stop", None))
             walk(getattr(node, "step", None))
-            push()
+            stack.append(set())
             add_inner(_name_id(getattr(node, "target", None)))
             walk(getattr(node, "body", None))
-            pop()
+            stack.pop()
             return
         if isinstance(node, Forin):
             for it in getattr(node, "iter", None) or []:
                 walk(it)
-            push()
+            stack.append(set())
             for t in getattr(node, "targets", None) or []:
                 add_inner(_name_id(t))
             walk(getattr(node, "body", None))
-            pop()
+            stack.pop()
             return
         if isinstance(node, (While, Repeat, Do)):
             if isinstance(node, While):
                 walk(getattr(node, "test", None))
-            push()
+            stack.append(set())
             walk(getattr(node, "body", None))
             if isinstance(node, Repeat):
                 walk(getattr(node, "test", None))
-            pop()
+            stack.pop()
             return
         if isinstance(node, If):
             walk(getattr(node, "test", None))
-            push()
+            stack.append(set())
             walk(getattr(node, "body", None))
-            pop()
+            stack.pop()
             orelse = getattr(node, "orelse", None)
             while orelse is not None:
                 if isinstance(orelse, ElseIf):
                     walk(getattr(orelse, "test", None))
-                    push()
+                    stack.append(set())
                     walk(getattr(orelse, "body", None))
-                    pop()
+                    stack.pop()
                     orelse = getattr(orelse, "orelse", None)
                 else:
-                    push()
+                    stack.append(set())
                     walk(orelse)
-                    pop()
+                    stack.pop()
                     orelse = None
             return
         if isinstance(node, list):
             for item in node:
                 walk(item)
             return
-        if isinstance(node, (
-            Block, Call, Return, Table, BinaryOp, UnaryOp, Chunk,
-            Number, String, Nil, TrueExpr, FalseExpr, Break,
-            Comment, SemiColon, Label,
-        )):
+        if isinstance(node, _WALK_OK):
             for child in _iter_children(node):
                 walk(child)
             return
+        if on_unknown:
+            on_unknown()
+
+    for arg in getattr(anon, "args", None) or []:
+        if isinstance(arg, (Dots, Varargs)):
+            dots()
+        add_inner(_name_id(arg))
+    walk(getattr(anon, "body", None))
+
+
+def _analyze_anon(anon: AnonymousFunction) -> AnonUse:
+    """
+    1. syntax: unknown node / ... / goto
+    2. writes: `x =` only. `local x =` binds x, not a write
+    3. reads: free names used as values
+    """
+    use = AnonUse()
+
+    def mark_dots():
+        use.uses_dots = True
+
+    def mark_goto():
+        use.has_goto = True
+
+    def mark_unknown():
         use.unknown = True
 
-    walk(getattr(anon, "body", None))
+    _walk_anon(anon, on_dots=mark_dots, on_goto=mark_goto, on_unknown=mark_unknown)
+    if use.unknown or use.uses_dots or use.has_goto:
+        return use
+
+    writes: Set[str] = set()
+    _walk_anon(anon, on_free=lambda name, is_write: writes.add(name) if is_write else None)
+    reads: Set[str] = set()
+    _walk_anon(anon, on_free=lambda name, is_write: reads.add(name) if not is_write else None)
+
+    use.writes = writes
+    use.reads = reads
     return use
 
 
@@ -488,7 +521,8 @@ def _anon_params(anon: AnonymousFunction) -> Optional[List[str]]:
 def _single_capture_assign(anon: AnonymousFunction, writes: Set[str]) -> Optional[Tuple[str, Any]]:
     """Body is exactly one `name = expr` whose name is a captured write."""
     stmts = _real_stmts(getattr(anon, "body", None))
-    if len(stmts) != 1 or not isinstance(stmts[0], Assign):
+    # LocalAssign subclasses Assign. Sole `local x = expr` is not a capture write.
+    if len(stmts) != 1 or type(stmts[0]) is not Assign:
         return None
     assign = stmts[0]
     targets = getattr(assign, "targets", None) or []
