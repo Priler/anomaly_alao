@@ -39,7 +39,7 @@ python stalker_lua_lint.py [path_to_mods] [options]
 --fix-debug        Comment out debug statements (log, printf, print, etc.)
 --fix-nil          Auto-fix safe nil access patterns (wrap with if-then guard)
 --remove-dead-code Remove 100% safe dead code (unreachable code, if false blocks)
---hoist-anon-funcs Hoist function() ... end to a named local
+--hoist-anon-funcs Hoist function() ... end to a named local. Not part of --fix.
 --cache-threshold  Minimum function call count to trigger caching (default: 4)
 
 --direct           Process scripts directly (no gamedata/scripts structure required)
