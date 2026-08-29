@@ -238,12 +238,12 @@ class TestAnonHoist(unittest.TestCase):
             "local function sort_by_dots(parts, sorter, table)\n"
             "\tlocal ok = pcall(function() return table.sort(\n"
             "\t\tparts,\n"
-            "\t\tfunction(a, b) return sorter(a, b) end\n"
+            "\t\tfunction(a, b) return a < b end\n"
             "\t) end)\n"
             "end\n"
         )
         out = transform(src)
-        self.assertIn("pcall(sort_by_dots_anon_1,", out)
+        self.assertRegex(out, r"pcall\(sort_by_dots_anon_\d+,")
         self.assertNotIn("pcall(function()", out)
         self.assertNotRegex(out, r"\) end\nend")
         from luaparser import ast as lua_ast
@@ -806,7 +806,13 @@ class TestAnonHoist(unittest.TestCase):
         out = transform(src)
         self.assertEqual(out, src)
         red = _findings(src, "anon_skip")
-        self.assertTrue(any("writes" in (f.details.get("skip_reason") or "") for f in red))
+        self.assertTrue(
+            any(
+                "writes" in (f.details.get("skip_reason") or "")
+                or "nested function" in (f.details.get("skip_reason") or "")
+                for f in red
+            )
+        )
 
     def test_assign_rewrite_skips_nested_function(self):
         src = (
@@ -863,6 +869,8 @@ class TestAnonHoist(unittest.TestCase):
         )
         out = transform(src)
         self.assertEqual(out, src)
+        red = _findings(src, "anon_skip")
+        self.assertTrue(any("extra args" in (f.details.get("skip_reason") or "") for f in red))
 
     def test_for_local_callback_skips(self):
         src = (
@@ -874,6 +882,48 @@ class TestAnonHoist(unittest.TestCase):
         )
         out = transform(src)
         self.assertEqual(out, src)
+        red = _findings(src, "anon_skip")
+        self.assertTrue(any("extra args" in (f.details.get("skip_reason") or "") for f in red))
+
+    def test_assign_nested_upvalue_skips(self):
+        # Nested func must keep the upvalue. Forwarding x as a pcall arg
+        # would snapshot it; f() after x = 2 would see 1.
+        src = (
+            "do\n"
+            "\tlocal x = 1\n"
+            "\tlocal f\n"
+            "\tpcall(function()\n"
+            "\t\tf = function() return x end\n"
+            "\tend)\n"
+            "\tx = 2\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertEqual(out, src)
+        red = _findings(src, "anon_skip")
+        self.assertTrue(
+            any("nested function" in (f.details.get("skip_reason") or "") for f in red)
+        )
+
+    def test_pcall_nested_callback_upvalue_skips(self):
+        src = (
+            "local function wrap()\n"
+            "\tlocal x = 1\n"
+            "\tpcall(function()\n"
+            "\t\tCreateTimeEvent(\"a\", \"b\", 0, function() return x end)\n"
+            "\tend)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertEqual(out, src)
+        red = _findings(src, "anon_skip")
+        self.assertTrue(
+            any(
+                "enclosing" in (f.details.get("skip_reason") or "")
+                or "extra args" in (f.details.get("skip_reason") or "")
+                for f in red
+            )
+        )
 
     def test_local_assign_same_name_skips(self):
         # Lua binds the new x after the initializer. Inner x is outer/global.

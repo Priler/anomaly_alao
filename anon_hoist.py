@@ -371,6 +371,7 @@ class AnonUse:
 
 # Parser leftover, not Lua: `for i = 1, #t` has no step, so step is a raw 1.
 _LEAF = (int, float, str, bool, bytes)
+_FUNC_NODES = (Function, LocalFunction, Method, AnonymousFunction)
 _WALK_OK = (
     Block, Call, Return, Table, BinaryOp, UnaryOp, Chunk,
     Number, String, Nil, TrueExpr, FalseExpr, Break,
@@ -378,7 +379,15 @@ _WALK_OK = (
 )
 
 
-def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None, on_unknown=None):
+def _walk_anon(
+    func,
+    on_free=None,
+    on_dots=None,
+    on_goto=None,
+    on_unknown=None,
+    enter_nested=False,
+    extra_binds=(),
+):
     """Walk the body. Track names born here. Callers listen for free names.
 
     Bind vs write:
@@ -457,7 +466,7 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
             for v in getattr(node, "values", None) or []:
                 walk(v)
             return
-        if isinstance(node, (Function, LocalFunction, Method, AnonymousFunction)):
+        if isinstance(node, _FUNC_NODES):
             # Nested function: its locals are not free names of the outer.
             if isinstance(node, LocalFunction):
                 add_inner(_name_id(node.name))
@@ -470,6 +479,11 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
                     walk(name)
             elif isinstance(node, Method):
                 walk(getattr(node, "source", None))
+            if not enter_nested:
+                # Body is classified on its own. Merging its reads/writes
+                # into the outer can mark an assign rewrite safe when the
+                # nested func still needs the original upvalue.
+                return
             stack.append(set())
             if isinstance(node, Method):
                 add_inner("self")
@@ -542,12 +556,14 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
             # Node type we do not handle. Fail closed.
             on_unknown()
 
-    for arg in getattr(anon, "args", None) or []:
+    for name in extra_binds:
+        add_inner(name)
+    for arg in getattr(func, "args", None) or []:
         if isinstance(arg, (Dots, Varargs)):
             add_inner("...")
         else:
             add_inner(_name_id(arg))
-    walk(getattr(anon, "body", None))
+    walk(getattr(func, "body", None))
 
 
 def _analyze_anon(anon: AnonymousFunction) -> AnonUse:
@@ -569,8 +585,54 @@ def _analyze_anon(anon: AnonymousFunction) -> AnonUse:
     def mark_unknown():
         use.unknown = True
 
-    _walk_anon(anon, on_free=on_free, on_dots=mark_dots, on_goto=mark_goto, on_unknown=mark_unknown)
+    extra = ("self",) if isinstance(anon, Method) else ()
+    _walk_anon(
+        anon,
+        on_free=on_free,
+        on_dots=mark_dots,
+        on_goto=mark_goto,
+        on_unknown=mark_unknown,
+        extra_binds=extra,
+    )
     return use
+
+
+def _has_func_node(node) -> bool:
+    if node is None or isinstance(node, _LEAF):
+        return False
+    if isinstance(node, _FUNC_NODES):
+        return True
+    if isinstance(node, list):
+        return any(_has_func_node(x) for x in node)
+    return any(_has_func_node(c) for c in _iter_children(node))
+
+
+def _iter_func_nodes(node):
+    if node is None or isinstance(node, _LEAF):
+        return
+    if isinstance(node, list):
+        for x in node:
+            yield from _iter_func_nodes(x)
+        return
+    if isinstance(node, _FUNC_NODES):
+        yield node
+    for child in _iter_children(node):
+        yield from _iter_func_nodes(child)
+
+
+def _nested_uses_enclosing(anon, enclosing: Set[str]) -> bool:
+    """True if a nested function uses a name bound outside this anon."""
+    if not enclosing:
+        # Nested `...` still needs the outer function's vararg.
+        for n in _iter_func_nodes(getattr(anon, "body", None)):
+            if _analyze_anon(n).uses_dots:
+                return True
+        return False
+    for n in _iter_func_nodes(getattr(anon, "body", None)):
+        use = _analyze_anon(n)
+        if use.uses_dots or (use.reads | use.writes) & enclosing:
+            return True
+    return False
 
 
 def _anon_params(anon: AnonymousFunction) -> Optional[List[str]]:
@@ -610,6 +672,9 @@ def _single_capture_assign(anon: AnonymousFunction, writes: Set[str]) -> Optiona
         return None
     name = _name_id(targets[0])
     if not name or name not in writes:
+        return None
+    # Nested func in the rhs would escape, or write some other name.
+    if _has_func_node(values[0]):
         return None
     return name, values[0]
 
@@ -877,6 +942,9 @@ def classify_anon(
 
     writes = set(use.writes)
     reads = set(use.reads) - writes
+    if writes and _has_func_node(getattr(anon, "body", None)):
+        details["skip_reason"] = "contains nested function"
+        return details
     # Only safe write: body is exactly `x = expr` on pcall. Else skip.
     assign_info = _single_capture_assign(anon, writes) if writes else None
 
@@ -982,6 +1050,9 @@ def classify_anon(
 
     captures = sorted(reads)
     enclosing = _enclosing_bound_names(scope, anon)
+    if _nested_uses_enclosing(anon, enclosing):
+        details["skip_reason"] = "nested function captures enclosing locals"
+        return details
     must_forward = [c for c in captures if c in enclosing]
     # pcall can take extra args. table.sort / xpcall / `x or function()` cannot.
     can_forward = role == "pcall"
