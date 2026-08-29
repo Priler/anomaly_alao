@@ -16,6 +16,7 @@ Options:
     --fix-nil          Fix safe nil access patterns (wrap with if-then guard)
     --remove-dead-code / --debloat
                        Remove 100% safe dead code (unreachable code, if false blocks)
+    --hoist-anon-funcs Hoist function() ... end to a named local. Not part of --fix.
     --cache-threshold N
                        Minimum function call count to trigger caching (default: 4)
                        Hot callbacks use N-1. Lower = more aggressive caching.
@@ -77,10 +78,17 @@ from reporter import Reporter
 from models import Finding
 
 
-def analyze_file_with_timeout(file_path: Path, timeout: float, cache_threshold: int = 4, experimental: bool = False):
+def analyze_file_with_timeout(file_path: Path, timeout: float, cache_threshold: int = 4,
+                              experimental: bool = False, hoist_anon_funcs: bool = False):
     """Analyze a file with a timeout to prevent hanging on problematic files."""
     executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(analyze_file, file_path, cache_threshold=cache_threshold, experimental=experimental)
+    future = executor.submit(
+        analyze_file,
+        file_path,
+        cache_threshold=cache_threshold,
+        experimental=experimental,
+        hoist_anon_funcs=hoist_anon_funcs,
+    )
     try:
         result = future.result(timeout=timeout)
         executor.shutdown(wait=False)
@@ -93,12 +101,19 @@ def analyze_file_with_timeout(file_path: Path, timeout: float, cache_threshold: 
 
 def analyze_file_worker(args_tuple):
     """Worker function for parallel analyze_file calls."""
-    mod_name, script_path, timeout, cache_threshold, experimental = args_tuple
+    mod_name, script_path, timeout, cache_threshold, experimental, hoist_anon_funcs = args_tuple
     try:
         if timeout and timeout > 0:
-            findings = analyze_file_with_timeout(script_path, timeout, cache_threshold, experimental)
+            findings = analyze_file_with_timeout(
+                script_path, timeout, cache_threshold, experimental, hoist_anon_funcs
+            )
         else:
-            findings = analyze_file(script_path, cache_threshold=cache_threshold, experimental=experimental)
+            findings = analyze_file(
+                script_path,
+                cache_threshold=cache_threshold,
+                experimental=experimental,
+                hoist_anon_funcs=hoist_anon_funcs,
+            )
         return (mod_name, script_path, findings, None)
     except TimeoutError as e:
         return (mod_name, script_path, [], f"TimeoutError: {e}")
@@ -109,7 +124,7 @@ def analyze_file_worker(args_tuple):
 
 def transform_file_worker(args_tuple):
     """Worker function for parallel transform_file calls."""
-    script_path, backup, fix_debug, fix_yellow, experimental, fix_nil, remove_dead_code, cache_threshold = args_tuple
+    script_path, backup, fix_debug, fix_yellow, experimental, fix_nil, remove_dead_code, cache_threshold, hoist_anon_funcs = args_tuple
     try:
         modified, _, edit_count = transform_file(
             script_path,
@@ -120,6 +135,7 @@ def transform_file_worker(args_tuple):
             fix_nil=fix_nil,
             remove_dead_code=remove_dead_code,
             cache_threshold=cache_threshold,
+            hoist_anon_funcs=hoist_anon_funcs,
         )
         return (script_path, modified, edit_count, None)
     except Exception as e:
@@ -228,6 +244,12 @@ def main():
         action="store_true",
         dest="remove_dead_code",
         help="Remove 100%% safe dead code (unreachable code after return, if false blocks, etc.)"
+    )
+    parser.add_argument(
+        "--hoist-anon-funcs",
+        action="store_true",
+        dest="hoist_anon_funcs",
+        help="Hoist anonymous function() ... end to a named local. Not part of --fix."
     )
     parser.add_argument(
         "--experimental",
@@ -380,6 +402,9 @@ def main():
                 elif flag == 'fix-debug':
                     args.fix_debug = True
                     print(f"  Recovered: --fix-debug")
+                elif flag == 'hoist-anon-funcs':
+                    args.hoist_anon_funcs = True
+                    print("  Recovered: --hoist-anon-funcs")
                 elif flag == 'experimental':
                     args.experimental = True
                     print(f"  Recovered: --experimental")
@@ -633,7 +658,8 @@ def main():
 
     # check if any fix flags are set
     fix_flags_set = (args.fix or args.fix_debug or args.fix_yellow or 
-                     args.experimental or args.fix_nil or args.remove_dead_code)
+                     args.experimental or args.fix_nil or args.remove_dead_code
+                     or args.hoist_anon_funcs)
     
     # auto-backup on first fix run (safety mechanism)
     if fix_flags_set and not args.no_first_time_auto_backup and not args.backup_all_scripts:
@@ -693,7 +719,8 @@ def main():
 
     # prepare work items for parallel analysis
     work_items = [
-        (mod_name, script_path, args.timeout, args.cache_threshold, args.experimental)
+        (mod_name, script_path, args.timeout, args.cache_threshold, args.experimental,
+         args.hoist_anon_funcs)
         for mod_name, script_path in all_files
     ]
 
@@ -785,12 +812,14 @@ def main():
                         script_path, args.timeout,
                         cache_threshold=args.cache_threshold,
                         experimental=args.experimental,
+                        hoist_anon_funcs=args.hoist_anon_funcs,
                     )
                 else:
                     findings = analyze_file(
                         script_path,
                         cache_threshold=args.cache_threshold,
                         experimental=args.experimental,
+                        hoist_anon_funcs=args.hoist_anon_funcs,
                     )
                 files_analyzed += 1
                 if findings:
@@ -814,7 +843,7 @@ def main():
     files_modified = 0
     total_edits = 0
 
-    if args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code:
+    if args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code or args.hoist_anon_funcs:
         # proceed with fixes (auto-backup already handled before analysis)
         fix_msg = "Applying fixes"
         fix_types = []
@@ -830,6 +859,8 @@ def main():
             fix_types.append("NIL-GUARD")
         if args.remove_dead_code:
             fix_types.append("DEAD-CODE")
+        if args.hoist_anon_funcs:
+            fix_types.append("ANON-HOIST")
         print(f"{fix_msg} ({', '.join(fix_types)}) with {num_workers} workers...")
 
         # prepare work items, skip files that already have .alao-bak (prevent double-fix)
@@ -843,7 +874,7 @@ def main():
                     print(f"  [SKIP] {script_path.name} - backup already exists")
             else:
                 work_items.append(
-                    (script_path, args.backup, args.fix_debug, args.fix_yellow, args.experimental, args.fix_nil, args.remove_dead_code, args.cache_threshold)
+                    (script_path, args.backup, args.fix_debug, args.fix_yellow, args.experimental, args.fix_nil, args.remove_dead_code, args.cache_threshold, args.hoist_anon_funcs)
                 )
         
         if skipped_has_backup > 0 and not args.quiet:
@@ -950,6 +981,7 @@ def main():
                             fix_nil=args.fix_nil,
                             remove_dead_code=args.remove_dead_code,
                             cache_threshold=args.cache_threshold,
+                            hoist_anon_funcs=args.hoist_anon_funcs,
                         )
                         if modified:
                             files_modified += 1
@@ -985,7 +1017,7 @@ def main():
         print(f"Files skipped (timeout/error): {files_skipped}")
     if parse_errors > 0:
         print(f"Files with parse errors: {parse_errors}")
-    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code):
+    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code or args.hoist_anon_funcs):
         print(f"Files modified: {files_modified}")
         print(f"Total edits applied: {total_edits}")
 
@@ -1005,6 +1037,10 @@ def main():
                            if f.pattern_name.startswith('dead_code_') and f.details.get('is_safe_to_remove'))
     unused_count = sum(1 for f in reporter.all_findings if f.pattern_name.startswith('unused_'))
 
+    anon_hoist_count = sum(1 for f in reporter.all_findings if f.pattern_name == 'anon_hoist')
+    anon_skip_count = sum(1 for f in reporter.all_findings if f.pattern_name == 'anon_skip')
+    anon_count = anon_hoist_count + anon_skip_count
+
     findings_str = f"{green_count} GREEN (auto-fixable), {yellow_count} YELLOW (review), {red_count} RED (info)"
     if debug_count > 0:
         findings_str += f", {debug_count} DEBUG (logging)"
@@ -1012,6 +1048,8 @@ def main():
         findings_str += f", {nil_count} NIL ({nil_fixable} fixable)"
     if dead_code_count > 0 or unused_count > 0:
         findings_str += f", {dead_code_count + unused_count} DEAD-CODE ({dead_code_fixable} removable)"
+    if anon_count > 0:
+        findings_str += f", {anon_count} ANON ({anon_hoist_count} hoistable)"
     print(f"\nFindings: {findings_str}")
 
     if green_count > 0 and not args.fix:
@@ -1026,7 +1064,7 @@ def main():
         print("Tip: Run with --fix-nil to add nil guards for safe nil access patterns")
     if dead_code_fixable > 0 and not args.remove_dead_code:
         print("Tip: Run with --remove-dead-code to remove safe unreachable code")
-    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code):
+    if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code or args.hoist_anon_funcs):
         print("Tip: Run with --revert to undo all changes using .alao-bak files")
 
 

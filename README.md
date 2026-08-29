@@ -39,6 +39,7 @@ python stalker_lua_lint.py [path_to_mods] [options]
 --fix-debug        Comment out debug statements (log, printf, print, etc.)
 --fix-nil          Auto-fix safe nil access patterns (wrap with if-then guard)
 --remove-dead-code Remove 100% safe dead code (unreachable code, if false blocks)
+--hoist-anon-funcs Hoist function() ... end to a named local. Not part of --fix.
 --cache-threshold  Minimum function call count to trigger caching (default: 4)
 
 --direct           Process scripts directly (no gamedata/scripts structure required)
@@ -101,6 +102,7 @@ _Notice a decreased frame time and AVG FPS increase. Keep in mind this was teste
 | Repeated `get_hud()` | `local hud = get_hud()` | Medium - cached singleton |
 | Repeated `:section()` | `local sec = obj:section()` | Medium - immutable property |
 | Repeated `:id()` | `local id = obj:id()` | Medium - immutable property |
+| `function() ... end` | `local name = function` + use that name | High - no per-run closure alloc. Opt-in via `--hoist-anon-funcs` (not part of `--fix`) |
 
 
 ### YELLOW (may cause CTDs, fix with `--fix-yellow`)
@@ -121,6 +123,7 @@ Pay attention some of this fixes requires `--experimental` flag.
 | `vector()` in hot loop | Allocates new vector each iteration | Critical |
 | Constant conditions | `if true then` / `if false then` |
 | Unnecessary else | `if x then return end else ...` |
+| `function() ... end` skipped | Enclosing locals the caller cannot take, writes that are not a single assign, outer `...` the caller cannot pass, long strings, local cap |
 
 
 ### DEBUG (comment out with `--fix-debug`)
@@ -220,6 +223,54 @@ This optimization reduces GC pressure from O(n²) to O(n) for string building.
 **Safety:** Only applied when:
 - Variable is initialized to `""` before the loop
 - Pattern is simple `var = var .. expr`
+
+## Anon hoist (`--hoist-anon-funcs`)
+
+`function() ... end` allocates a new closure every time that line runs.  
+`--hoist-anon-funcs` hoists it to a chunk-level `local {caller}_anon_{n} = function(...)` and uses that name.
+
+If the caller can take extra args, read-only captured names become params on the anon func.  
+Everyone else (`table.sort`, `x or function()`, callbacks) keeps the same params. Enclosing locals or outer writes -> skip.
+
+File-scope `foo = function()` / `local foo = function()` is already named. Left alone.
+
+**Before:**
+```lua
+local function apply(info)
+    pcall(function()
+        info.desc:AdjustHeightToText()
+    end)
+end
+
+local function sort_rows(data)
+    table.sort(data, function(a, b)
+        return (a and a[1] or 0) < (b and b[1] or 0)
+    end)
+end
+```
+
+**After:**
+```lua
+local apply_anon_1 = function(info)
+    info.desc:AdjustHeightToText()
+end
+local function apply(info)
+    pcall(apply_anon_1, info)
+end
+
+local sort_rows_anon_1 = function(a, b)
+    return (a and a[1] or 0) < (b and b[1] or 0)
+end
+local function sort_rows(data)
+    table.sort(data, sort_rows_anon_1)
+end
+```
+
+A single-statement `function() x = expr end` passed to a caller that reports success/failure becomes `return expr` plus `if ok then x = v end`, so a failed call does not store the error string into `x`.
+
+Skipped (RED, no edit): writes that are not that single-assign shape, enclosing locals where the caller cannot take extra args, outer `...` the caller cannot pass, assign-rewrites used as `if call(...)` expressions, long strings (`[[...]]`, so reindent cannot change string data), assign-rewrites that contain a nested function, and files that would go over Lua 5.1's 200 locals. Own `...` hoists. pcall can pass outer `...`.
+
+Not part of default `--fix`. Analysis and skip reports only run with `--hoist-anon-funcs`.
 
 ## Nil checks performance impact
 

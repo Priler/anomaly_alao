@@ -384,9 +384,11 @@ class VectorAllocationInfo:
 class ASTAnalyzer:
     """AST-based Lua code analyzer."""
 
-    def __init__(self, cache_threshold: int = 4, experimental: bool = False):
+    def __init__(self, cache_threshold: int = 4, experimental: bool = False,
+                 hoist_anon_funcs: bool = False):
         self.cache_threshold = cache_threshold
         self.experimental = experimental
+        self.hoist_anon_funcs = bool(hoist_anon_funcs)
         self.reset()
 
     def reset(self):
@@ -434,17 +436,23 @@ class ASTAnalyzer:
         # cleared per-run so a re-used analyzer can't see a stale tree
         self._ast_tree: Optional[Node] = None
 
-    def analyze_file(self, file_path: Path) -> List[Finding]:
-        """Analyze a Lua file and return findings."""
+    def analyze_file(self, file_path: Path, source: Optional[str] = None) -> List[Finding]:
+        """Analyze a Lua file and return findings.
+
+        `source` skips the disk read (hoist-then-fix re-analyze).
+        """
         self.reset()
         self.file_path = file_path
 
-        try:
-            encoding = detect_file_encoding(file_path)
-            self.source = file_path.read_text(encoding=encoding)
-            self._file_encoding = encoding
-        except Exception:
-            return []
+        if source is not None:
+            self.source = source
+        else:
+            try:
+                encoding = detect_file_encoding(file_path)
+                self.source = file_path.read_text(encoding=encoding)
+                self._file_encoding = encoding
+            except Exception:
+                return []
 
         self.source_lines = self.source.splitlines()
 
@@ -916,7 +924,7 @@ class ASTAnalyzer:
             self._visit(iter_expr)
 
         self.loop_depth += 1
-        self._enter_scope('<forin>', line, 'loop')
+        self._enter_scope('<forin>', line, 'loop', node=node)
 
         # loop variables are local to loop
         for target in node.targets:
@@ -956,7 +964,7 @@ class ASTAnalyzer:
             self._visit(node.step)
 
         self.loop_depth += 1
-        self._enter_scope('<fornum>', line, 'loop')
+        self._enter_scope('<fornum>', line, 'loop', node=node)
 
         if isinstance(node.target, Name):
             var_name = node.target.id
@@ -990,7 +998,7 @@ class ASTAnalyzer:
         self._visit(node.test)
 
         self.loop_depth += 1
-        self._enter_scope('<while>', line, 'loop')
+        self._enter_scope('<while>', line, 'loop', node=node)
         self._visit(node.body)
         end_line = self._get_end_line(node)
         self._exit_scope(end_line)
@@ -1001,7 +1009,7 @@ class ASTAnalyzer:
         line = self._get_line(node)
 
         self.loop_depth += 1
-        self._enter_scope('<repeat>', line, 'loop')
+        self._enter_scope('<repeat>', line, 'loop', node=node)
         self._visit(node.body)
         self._visit(node.test)
         end_line = self._get_end_line(node)
@@ -1029,7 +1037,7 @@ class ASTAnalyzer:
         body_line = self._get_line(node.body) if node.body is not None else self._get_line(node)
         body_end = self._get_end_line(node.body) if node.body is not None else self._get_end_line(node)
         self.if_chain_stack.append((if_id, 0))
-        self._enter_scope('<if-body>', body_line, 'block')
+        self._enter_scope('<if-body>', body_line, 'block', node=node.body)
         self._visit(node.body)
         self._exit_scope(body_end)
         self.if_chain_stack.pop()
@@ -1047,7 +1055,7 @@ class ASTAnalyzer:
             line = self._get_line(node)
             end = self._get_end_line(node)
             self.if_chain_stack.append((if_id, branch_idx))
-            self._enter_scope('<elseif-body>', line, 'block')
+            self._enter_scope('<elseif-body>', line, 'block', node=node)
             self._visit(node.test)
             self._visit(node.body)
             self._exit_scope(end)
@@ -1060,7 +1068,7 @@ class ASTAnalyzer:
             line = self._get_line(node)
             end = self._get_end_line(node)
             self.if_chain_stack.append((if_id, -1))
-            self._enter_scope('<else-body>', line, 'block')
+            self._enter_scope('<else-body>', line, 'block', node=node)
             self._visit(node)
             self._exit_scope(end)
             self.if_chain_stack.pop()
@@ -1069,7 +1077,7 @@ class ASTAnalyzer:
             line = self._get_line(node)
             end = self._get_end_line(node)
             self.if_chain_stack.append((if_id, -1))
-            self._enter_scope('<else-body>', line, 'block')
+            self._enter_scope('<else-body>', line, 'block', node=node)
             self._visit(node)
             self._exit_scope(end)
             self.if_chain_stack.pop()
@@ -1083,7 +1091,7 @@ class ASTAnalyzer:
         """Handle `do ... end` block - its body is a fresh local scope."""
         line = self._get_line(node)
         end_line = self._get_end_line(node)
-        self._enter_scope('<do>', line, 'block')
+        self._enter_scope('<do>', line, 'block', node=node)
         body = getattr(node, 'body', None)
         if body is not None:
             self._visit(body)
@@ -1827,6 +1835,8 @@ class ASTAnalyzer:
         self._analyze_per_frame_callbacks()
         self._analyze_distance_to_comparisons()
         self._analyze_vector_allocations_in_loops()
+        if self.hoist_anon_funcs:
+            self._analyze_anon_hoist()
 
     def _analyze_table_insert(self):
         """Find table.insert(t, v) that can be t[#t+1] = v."""
@@ -3159,6 +3169,11 @@ class ASTAnalyzer:
                 source_line=self._get_source_line(alloc.line),
             ))
 
+    def _analyze_anon_hoist(self):
+        """Opt-in: lift function() ... end to a named local at file scope."""
+        from anon_hoist import analyze_tree
+        analyze_tree(self)
+
     def _get_source_line(self, line_num: int) -> str:
         """Get source line by number."""
         if 0 < line_num <= len(self.source_lines):
@@ -3166,7 +3181,12 @@ class ASTAnalyzer:
         return ""
 
 
-def analyze_file(file_path: Path, cache_threshold: int = 4, experimental: bool = False) -> List[Finding]:
+def analyze_file(file_path: Path, cache_threshold: int = 4, experimental: bool = False,
+                 hoist_anon_funcs: bool = False) -> List[Finding]:
     """Convenience function to analyze a file."""
-    analyzer = ASTAnalyzer(cache_threshold=cache_threshold, experimental=experimental)
+    analyzer = ASTAnalyzer(
+        cache_threshold=cache_threshold,
+        experimental=experimental,
+        hoist_anon_funcs=hoist_anon_funcs,
+    )
     return analyzer.analyze_file(file_path)

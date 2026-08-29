@@ -40,6 +40,9 @@ class SourceEdit:
     # if its group has no surviving replacements. Replacements in the same
     # group leave this empty.
     is_enabler: bool = False
+    # Same-position insertions apply high-seq first so they land later in the
+    # file (end-to-start apply). Used to keep foo_anon_1 above foo_anon_2.
+    seq: int = 0
 
 
 class ASTTransformer:
@@ -64,7 +67,8 @@ class ASTTransformer:
                        fix_debug: bool = False, fix_yellow: bool = False,
                        experimental: bool = False, fix_nil: bool = False,
                        remove_dead_code: bool = False,
-                       cache_threshold: int = 4) -> Tuple[bool, str, int]:
+                       cache_threshold: int = 4,
+                       hoist_anon_funcs: bool = False) -> Tuple[bool, str, int]:
         """
         Transform a file based on findings.
         Returns (was_modified, new_content, edit_count).
@@ -80,14 +84,38 @@ class ASTTransformer:
         self.experimental = experimental
         self.fix_nil = fix_nil
         self.remove_dead_code = remove_dead_code
+        self.hoist_anon_funcs = bool(hoist_anon_funcs)
 
         # run analyzer with user-specified cache_threshold
-        self.analyzer = ASTAnalyzer(cache_threshold=cache_threshold, experimental=experimental)
+        self.analyzer = ASTAnalyzer(
+            cache_threshold=cache_threshold,
+            experimental=experimental,
+            hoist_anon_funcs=self.hoist_anon_funcs,
+        )
         findings = self.analyzer.analyze_file(file_path)
 
         # get source from analyzer and compute line offsets
         self.source = self.analyzer.source
         self._compute_line_offsets()
+        original = self.source
+        hoist_edits = 0
+
+        # Hoist first, then re-analyze, then the rest of --fix. Same-pass
+        # --fix offsets still point at the old `function() ... end`.
+        if self.hoist_anon_funcs:
+            for finding in findings:
+                if finding.pattern_name == 'anon_hoist':
+                    self._generate_edits(finding)
+            if self.edits:
+                hoisted = self._apply_edits()
+                if hoisted != self.source:
+                    hoist_edits = len(self.edits)
+                    findings = self.analyzer.analyze_file(file_path, source=hoisted)
+                    self.source = self.analyzer.source
+                    self._compute_line_offsets()
+            self.edits = []
+            self._next_group_id = 1
+            self.hoist_anon_funcs = False
 
         # filter to fixable severities
         allowed_severities = {'GREEN'}
@@ -96,7 +124,8 @@ class ASTTransformer:
         if fix_debug:
             allowed_severities.add('DEBUG')
 
-        fixable = [f for f in findings if f.severity in allowed_severities]
+        fixable = [f for f in findings if f.severity in allowed_severities
+                   and f.pattern_name != 'anon_hoist']
         
         # add experimental fixes (string_concat_in_loop) if enabled
         # only add if not already included via fix_yellow
@@ -127,23 +156,13 @@ class ASTTransformer:
                 if df.line_num not in existing_lines:
                     fixable.append(df)
 
-        if not fixable:
-            return False, self.source, 0
+        if fixable:
+            for finding in fixable:
+                self._generate_edits(finding)
 
-        # generate edits for each finding
-        for finding in fixable:
-            self._generate_edits(finding)
-
-        if not self.edits:
-            return False, self.source, 0
-
-        edit_count = len(self.edits)
-
-        # apply edits
-        new_content = self._apply_edits()
-
-        if new_content == self.source:
-            return False, self.source, 0
+        new_content = self._apply_edits() if self.edits else self.source
+        if new_content == original:
+            return False, original, 0
 
         if not dry_run:
             if backup:
@@ -154,7 +173,7 @@ class ASTTransformer:
 
             file_path.write_text(new_content, encoding=getattr(self.analyzer, '_file_encoding', 'latin-1'))
 
-        return True, new_content, edit_count
+        return True, new_content, len(self.edits) + hoist_edits
 
     def _generate_edits(self, finding: Finding):
         """Generate source edits for a finding."""
@@ -193,9 +212,56 @@ class ASTTransformer:
             self._edit_repeated_calls(finding)
         elif pattern == 'distance_to_comparison':
             self._edit_distance_to_comparison(finding)
+        elif pattern == 'anon_hoist':
+            if getattr(self, 'hoist_anon_funcs', False):
+                self._edit_anon(finding)
 
 
     # Edit methods using AST positions
+
+    def _edit_anon(self, finding: Finding):
+        """Insert the named func at file scope. Replace `function() ... end` with the name."""
+        d = finding.details or {}
+        if not d.get('safe'):
+            return
+        anon_text = d.get('anon_text')
+        insert_char = d.get('insert_char')
+        replace_start = d.get('replace_start')
+        replace_end = d.get('replace_end')
+        replace_text = d.get('replace_text')
+        if not anon_text or insert_char is None:
+            return
+        gid = self._next_group_id
+        self._next_group_id += 1
+        absorbed = bool(d.get('absorb_callsite'))
+        if absorbed:
+            # Already pasted into an outer. Only insert this named func.
+            self.edits.append(SourceEdit(
+                start_char=insert_char,
+                end_char=insert_char,
+                replacement=anon_text,
+                priority=100,
+                seq=int(d.get('insert_seq') or 0),
+            ))
+            return
+        if replace_start is None or replace_end is None or replace_text is None:
+            return
+        self.edits.append(SourceEdit(
+            start_char=insert_char,
+            end_char=insert_char,
+            replacement=anon_text,
+            priority=100,
+            group_id=gid,
+            is_enabler=True,
+            seq=int(d.get('insert_seq') or 0),
+        ))
+        self.edits.append(SourceEdit(
+            start_char=replace_start,
+            end_char=replace_end,
+            replacement=replace_text,
+            priority=50,
+            group_id=gid,
+        ))
 
     def _edit_table_insert(self, finding: Finding):
         """Convert table.insert(t, v) to t[#t+1] = v."""
@@ -2347,7 +2413,7 @@ class ASTTransformer:
 
         # Apply end-to-start so earlier positions stay valid.
         admitted = admitted_repl + admitted_ins
-        admitted.sort(key=lambda e: -e.start_char)
+        admitted.sort(key=lambda e: (-e.start_char, -e.seq))
         result = self.source
         for edit in admitted:
             result = result[:edit.start_char] + edit.replacement + result[edit.end_char:]
@@ -2358,8 +2424,10 @@ def transform_file(file_path: Path, backup: bool = True, dry_run: bool = False,
                    fix_debug: bool = False, fix_yellow: bool = False,
                    experimental: bool = False, fix_nil: bool = False,
                    remove_dead_code: bool = False,
-                   cache_threshold: int = 4) -> Tuple[bool, str, int]:
+                   cache_threshold: int = 4,
+                   hoist_anon_funcs: bool = False) -> Tuple[bool, str, int]:
     """Convenience function to transform a file. Returns (modified, content, edit_count)."""
     transformer = ASTTransformer()
     return transformer.transform_file(file_path, backup, dry_run, fix_debug, fix_yellow, 
-                                       experimental, fix_nil, remove_dead_code, cache_threshold)
+                                       experimental, fix_nil, remove_dead_code, cache_threshold,
+                                       hoist_anon_funcs=hoist_anon_funcs)
