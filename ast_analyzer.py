@@ -924,7 +924,7 @@ class ASTAnalyzer:
             self._visit(iter_expr)
 
         self.loop_depth += 1
-        self._enter_scope('<forin>', line, 'loop')
+        self._enter_scope('<forin>', line, 'loop', node=node)
 
         # loop variables are local to loop
         for target in node.targets:
@@ -964,7 +964,7 @@ class ASTAnalyzer:
             self._visit(node.step)
 
         self.loop_depth += 1
-        self._enter_scope('<fornum>', line, 'loop')
+        self._enter_scope('<fornum>', line, 'loop', node=node)
 
         if isinstance(node.target, Name):
             var_name = node.target.id
@@ -998,7 +998,7 @@ class ASTAnalyzer:
         self._visit(node.test)
 
         self.loop_depth += 1
-        self._enter_scope('<while>', line, 'loop')
+        self._enter_scope('<while>', line, 'loop', node=node)
         self._visit(node.body)
         end_line = self._get_end_line(node)
         self._exit_scope(end_line)
@@ -1009,7 +1009,7 @@ class ASTAnalyzer:
         line = self._get_line(node)
 
         self.loop_depth += 1
-        self._enter_scope('<repeat>', line, 'loop')
+        self._enter_scope('<repeat>', line, 'loop', node=node)
         self._visit(node.body)
         self._visit(node.test)
         end_line = self._get_end_line(node)
@@ -1037,7 +1037,7 @@ class ASTAnalyzer:
         body_line = self._get_line(node.body) if node.body is not None else self._get_line(node)
         body_end = self._get_end_line(node.body) if node.body is not None else self._get_end_line(node)
         self.if_chain_stack.append((if_id, 0))
-        self._enter_scope('<if-body>', body_line, 'block')
+        self._enter_scope('<if-body>', body_line, 'block', node=node.body)
         self._visit(node.body)
         self._exit_scope(body_end)
         self.if_chain_stack.pop()
@@ -1055,7 +1055,7 @@ class ASTAnalyzer:
             line = self._get_line(node)
             end = self._get_end_line(node)
             self.if_chain_stack.append((if_id, branch_idx))
-            self._enter_scope('<elseif-body>', line, 'block')
+            self._enter_scope('<elseif-body>', line, 'block', node=node)
             self._visit(node.test)
             self._visit(node.body)
             self._exit_scope(end)
@@ -1068,7 +1068,7 @@ class ASTAnalyzer:
             line = self._get_line(node)
             end = self._get_end_line(node)
             self.if_chain_stack.append((if_id, -1))
-            self._enter_scope('<else-body>', line, 'block')
+            self._enter_scope('<else-body>', line, 'block', node=node)
             self._visit(node)
             self._exit_scope(end)
             self.if_chain_stack.pop()
@@ -1077,7 +1077,7 @@ class ASTAnalyzer:
             line = self._get_line(node)
             end = self._get_end_line(node)
             self.if_chain_stack.append((if_id, -1))
-            self._enter_scope('<else-body>', line, 'block')
+            self._enter_scope('<else-body>', line, 'block', node=node)
             self._visit(node)
             self._exit_scope(end)
             self.if_chain_stack.pop()
@@ -1091,7 +1091,7 @@ class ASTAnalyzer:
         """Handle `do ... end` block - its body is a fresh local scope."""
         line = self._get_line(node)
         end_line = self._get_end_line(node)
-        self._enter_scope('<do>', line, 'block')
+        self._enter_scope('<do>', line, 'block', node=node)
         body = getattr(node, 'body', None)
         if body is not None:
             self._visit(body)

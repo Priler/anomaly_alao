@@ -757,9 +757,9 @@ def _chunk_local_decl_pos(tree) -> Dict[str, int]:
 def _enclosing_bound_names(scope, anon) -> Set[str]:
     """Locals from scopes around this function, not the function itself.
 
-    Globals and file-scope locals are not in here. Those stay visible after
-    we hoist to file scope. A name that is here must be passed as an extra
-    arg (pcall only) or we skip.
+    Function, do, if, and loop locals. File-scope locals and globals are
+    not in here. Those stay visible after we hoist to file scope. A name
+    that is here must be passed as an extra arg (pcall only) or we skip.
     """
     names: Set[str] = set()
     s = scope
@@ -810,9 +810,9 @@ def classify_anon(
 
     Skip if: outer `...` where the caller cannot take extra args, goto,
     unknown syntax, a `[[` long string, outer writes that are not a single
-    `x = expr` on pcall, enclosing-function locals where the caller cannot
-    take extra args (everything except pcall; xpcall never can), or we
-    cannot slice tokens.
+    `x = expr` on pcall, enclosing locals (function, do, if, loop) where
+    the caller cannot take extra args (everything except pcall; xpcall
+    never can), or we cannot slice tokens.
     Own `...` is fine. Globals and earlier file-scope locals are fine.
     """
     details: Dict[str, Any] = {"safe": False}
@@ -895,6 +895,17 @@ def classify_anon(
             details["skip_reason"] = "pcall already unpacks 2+ results"
             return details
         assigned, rhs_node = assign_info
+        if (
+            isinstance(assign_node, LocalAssign)
+            and assigned in {
+                _name_id(t) for t in (getattr(assign_node, "targets", None) or [])
+            }
+        ):
+            # `local x = pcall(function() x = 1 end)`: Lua binds the new x
+            # after the initializer. Inner x is the outer/global. Rewrite
+            # would write the new local.
+            details["skip_reason"] = "local x = pcall writes the same x"
+            return details
         rhs_src = _rhs_src(source, rhs_node)
         if rhs_src is None:
             details["skip_reason"] = "cannot slice assignment rhs"

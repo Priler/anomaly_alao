@@ -816,11 +816,78 @@ class TestAnonHoist(unittest.TestCase):
             "end\n"
         )
         out = transform(src)
-        self.assertIn("pcall(function()", out)
-        self.assertNotIn("return function()", out)
+        # Outer assign rewrite must not fire. Inner `function() return 1`
+        # may still hoist as an expr, so rhs can be a name.
+        self.assertRegex(out, r"pcall\(function\(\) x = ")
+        self.assertNotIn("then x =", out)
         red = _findings(src, "anon_skip")
         self.assertTrue(
             any("nested function" in (f.details.get("skip_reason") or "") for f in red)
+        )
+
+    def test_do_local_callback_skips(self):
+        src = (
+            "local function outer()\n"
+            "\tdo\n"
+            "\t\tlocal x = 1\n"
+            "\t\ttable.sort(t, function(a, b) return a < x end)\n"
+            "\tend\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertEqual(out, src)
+        red = _findings(src, "anon_skip")
+        self.assertTrue(any("extra args" in (f.details.get("skip_reason") or "") for f in red))
+
+    def test_do_local_pcall_forwards(self):
+        src = (
+            "local function outer()\n"
+            "\tdo\n"
+            "\t\tlocal x = 1\n"
+            "\t\tpcall(function() return x + 1 end)\n"
+            "\tend\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertIn("local outer_anon_1 = function(x)", out)
+        self.assertIn("pcall(outer_anon_1, x)", out)
+
+    def test_if_local_callback_skips(self):
+        src = (
+            "local function outer()\n"
+            "\tif true then\n"
+            "\t\tlocal x = 1\n"
+            "\t\tCreateTimeEvent(\"a\", \"b\", 0, function() return x end)\n"
+            "\tend\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertEqual(out, src)
+
+    def test_for_local_callback_skips(self):
+        src = (
+            "local function outer()\n"
+            "\tfor i = 1, 10 do\n"
+            "\t\ttable.sort(t, function(a, b) return a < i end)\n"
+            "\tend\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertEqual(out, src)
+
+    def test_local_assign_same_name_skips(self):
+        # Lua binds the new x after the initializer. Inner x is outer/global.
+        src = (
+            "local x = 0\n"
+            "local function f()\n"
+            "\tlocal x = pcall(function() x = 1 end)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertEqual(out, src)
+        red = _findings(src, "anon_skip")
+        self.assertTrue(
+            any("same x" in (f.details.get("skip_reason") or "") for f in red)
         )
 
     def test_reindent_strips_padded_hash_include(self):
