@@ -384,9 +384,11 @@ class VectorAllocationInfo:
 class ASTAnalyzer:
     """AST-based Lua code analyzer."""
 
-    def __init__(self, cache_threshold: int = 4, experimental: bool = False):
+    def __init__(self, cache_threshold: int = 4, experimental: bool = False,
+                 hoist_anon_funcs: bool = False):
         self.cache_threshold = cache_threshold
         self.experimental = experimental
+        self.hoist_anon_funcs = bool(hoist_anon_funcs)
         self.reset()
 
     def reset(self):
@@ -1833,7 +1835,8 @@ class ASTAnalyzer:
         self._analyze_per_frame_callbacks()
         self._analyze_distance_to_comparisons()
         self._analyze_vector_allocations_in_loops()
-        self._analyze_anon_hoist()
+        if self.hoist_anon_funcs:
+            self._analyze_anon_hoist()
 
     def _analyze_table_insert(self):
         """Find table.insert(t, v) that can be t[#t+1] = v."""
@@ -3178,7 +3181,12 @@ class ASTAnalyzer:
         return ""
 
 
-def analyze_file(file_path: Path, cache_threshold: int = 4, experimental: bool = False) -> List[Finding]:
+def analyze_file(file_path: Path, cache_threshold: int = 4, experimental: bool = False,
+                 hoist_anon_funcs: bool = False) -> List[Finding]:
     """Convenience function to analyze a file."""
-    analyzer = ASTAnalyzer(cache_threshold=cache_threshold, experimental=experimental)
+    analyzer = ASTAnalyzer(
+        cache_threshold=cache_threshold,
+        experimental=experimental,
+        hoist_anon_funcs=hoist_anon_funcs,
+    )
     return analyzer.analyze_file(file_path)

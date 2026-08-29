@@ -31,7 +31,7 @@ def _write(src: str) -> Path:
 def analyze(src: str):
     path = _write(src)
     try:
-        a = ASTAnalyzer()
+        a = ASTAnalyzer(hoist_anon_funcs=True)
         return a.analyze_file(path)
     finally:
         path.unlink(missing_ok=True)
@@ -229,7 +229,8 @@ class TestAnonHoist(unittest.TestCase):
         self.assertNotIn("pcall(function()", out)
         green = _findings(src, "anon_hoist")
         self.assertEqual(len(green), 1)
-        self.assertNotIn("sm", green[0].details.get("captures") or [])
+        self.assertIn("captures", green[0].details)
+        self.assertNotIn("sm", green[0].details["captures"])
 
     def test_multiline_return_does_not_double_end(self):
         # Packer style: `return foo(\n...\n) end` must not get a second end.
@@ -748,9 +749,8 @@ class TestAnonHoist(unittest.TestCase):
         from luaparser import ast as lua_ast
         lua_ast.parse(out)
 
-    def test_reindent_keeps_long_string_include(self):
-        # xrXMLParser: #include only if str[0] == '#'. Reindent pads the
-        # [[...]] body; a line that is then spaces-then-# gets the lead stripped.
+    def test_long_string_skips_hoist(self):
+        # Reindent would change [[...]] data. Skip instead.
         src = (
             "function on_xml_read()\n"
             "\tRegisterScriptCallback(\"on_xml_read\", function(name, xml)\n"
@@ -763,14 +763,81 @@ class TestAnonHoist(unittest.TestCase):
             "end\n"
         )
         out = transform(src)
-        self.assertIn("\n#include \"ui\\map_spots_paw.xml\"\n", out)
-        self.assertNotIn("    #include", out)
-        self.assertNotIn("\t#include", out)
-        from luaparser import ast as lua_ast
-        lua_ast.parse(out)
+        self.assertEqual(out, src)
+        red = _findings(src, "anon_skip")
+        self.assertTrue(any("long string" in (f.details.get("skip_reason") or "") for f in red))
 
-    def test_chunk_local_cap_drops_local_keyword(self):
-        # Lua 5.1: 200 locals per chunk. Past the cap, hoist must not add more.
+    def test_long_comment_still_hoists(self):
+        src = (
+            "local function foo()\n"
+            "\tpcall(function()\n"
+            "\t\t--[[ keep me ]]\n"
+            "\t\tlevel.enable_input()\n"
+            "\tend)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertIn("local foo_anon_1 = function(level)", out)
+        self.assertNotIn("pcall(function()", out)
+
+    def test_nested_function_on_local_is_a_capture(self):
+        src = (
+            "local function outer()\n"
+            "\tlocal obj = {}\n"
+            "\tpcall(function()\n"
+            "\t\tfunction obj.foo() end\n"
+            "\tend)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertIn("local outer_anon_1 = function(obj)", out)
+        self.assertIn("pcall(outer_anon_1, obj)", out)
+        self.assertIn("function obj.foo()", out)
+
+    def test_nested_function_name_write_skips(self):
+        src = (
+            "local function outer()\n"
+            "\tlocal foo\n"
+            "\tpcall(function()\n"
+            "\t\tfunction foo() end\n"
+            "\tend)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertEqual(out, src)
+        red = _findings(src, "anon_skip")
+        self.assertTrue(any("writes" in (f.details.get("skip_reason") or "") for f in red))
+
+    def test_assign_rewrite_skips_nested_function(self):
+        src = (
+            "local function f()\n"
+            "\tlocal x\n"
+            "\tpcall(function() x = function() return 1 end end)\n"
+            "end\n"
+        )
+        out = transform(src)
+        self.assertIn("pcall(function()", out)
+        self.assertNotIn("return function()", out)
+        red = _findings(src, "anon_skip")
+        self.assertTrue(
+            any("nested function" in (f.details.get("skip_reason") or "") for f in red)
+        )
+
+    def test_reindent_strips_padded_hash_include(self):
+        from anon_hoist import _reindent_anon
+        text = (
+            "local foo_anon_1 = function()\n"
+            "    local inc =\n"
+            "    [[\n"
+            "    #include \"ui\\map_spots_paw.xml\"\n"
+            "    ]]\n"
+            "end"
+        )
+        out = _reindent_anon(text, "", "    x")
+        self.assertIn("\n#include \"ui\\map_spots_paw.xml\"\n", out)
+
+    def test_chunk_local_cap_skips(self):
+        # Lua 5.1: 200 locals per chunk. Past the cap, do not emit globals.
         locs = "\n".join(f"local v{i} = {i}" for i in range(190))
         src = (
             locs + "\n"
@@ -779,10 +846,9 @@ class TestAnonHoist(unittest.TestCase):
             "end\n"
         )
         out = transform(src)
-        self.assertIn("wrap_anon_1 = function", out)
-        self.assertNotIn("local wrap_anon_1 = function", out)
-        from luaparser import ast as lua_ast
-        lua_ast.parse(out)
+        self.assertEqual(out, src)
+        red = _findings(src, "anon_skip")
+        self.assertTrue(any("local limit" in (f.details.get("skip_reason") or "") for f in red))
 
 
 if __name__ == "__main__":

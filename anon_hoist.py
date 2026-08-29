@@ -83,6 +83,8 @@ _END_TOKEN = re.compile(r"(?<![A-Za-z0-9_])end(?![A-Za-z0-9_])")
 _TRAIL_COMMENT = re.compile(r"(?:[ \t]*(?:--[^\n]*)?\n?)*\Z")
 # Last line already ends with `end` (`end`, `) end`, `return x end`).
 _TRAIL_END = re.compile(r"^(.*?)(?<![A-Za-z0-9_])end\s*$")
+# Long strings keep whitespace. `(?<!-)` drops `--[[` comments.
+_LONG_STRING = re.compile(r"(?<!-)\[=*\[")
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LUA_KEYWORDS = frozenset({
     "and", "break", "do", "else", "elseif", "end", "false", "for",
@@ -459,6 +461,15 @@ def _walk_anon(anon: AnonymousFunction, on_free=None, on_dots=None, on_goto=None
             # Nested function: its locals are not free names of the outer.
             if isinstance(node, LocalFunction):
                 add_inner(_name_id(node.name))
+            elif isinstance(node, Function):
+                # `function obj.foo()` reads obj. `function foo()` writes foo.
+                name = getattr(node, "name", None)
+                if isinstance(name, Name):
+                    walk(name, as_write=True)
+                else:
+                    walk(name)
+            elif isinstance(node, Method):
+                walk(getattr(node, "source", None))
             stack.append(set())
             if isinstance(node, Method):
                 add_inner("self")
@@ -798,9 +809,10 @@ def classify_anon(
     """Decide hoist vs skip. `safe` True means we will rewrite.
 
     Skip if: outer `...` where the caller cannot take extra args, goto,
-    unknown syntax, outer writes that are not a single `x = expr` on pcall,
-    enclosing-function locals where the caller cannot take extra args
-    (everything except pcall; xpcall never can), or we cannot slice tokens.
+    unknown syntax, a `[[` long string, outer writes that are not a single
+    `x = expr` on pcall, enclosing-function locals where the caller cannot
+    take extra args (everything except pcall; xpcall never can), or we
+    cannot slice tokens.
     Own `...` is fine. Globals and earlier file-scope locals are fine.
     """
     details: Dict[str, Any] = {"safe": False}
@@ -813,6 +825,9 @@ def classify_anon(
     fn_start, fn_end = _anon_span(source, anon)
     if None in (fn_start, fn_end):
         details["skip_reason"] = "missing first_token/last_token"
+        return details
+    if _LONG_STRING.search(source[fn_start:fn_end]):
+        details["skip_reason"] = "body contains a long string"
         return details
 
     call = parent if role in ("pcall", "xpcall") else None
@@ -1109,21 +1124,18 @@ def _reindent_anon(text: str, indent: str, source: str) -> str:
     return "\n".join(out)
 
 
-def _drop_local_if_chunk_full(drafts, chunk_locals):
+def _skip_if_chunk_full(drafts, chunk_locals):
     """Lua 5.1: 200 locals per function. Chunk locals plus `local foo_anon_N` count.
 
-    Over the cap, drop `local` so the name is a module/global assign.
+    Over the cap, skip the file. A bare `name = function` would be a global.
     """
     n_new = sum(1 for _, d in drafts if d.get("safe"))
     if len(chunk_locals) + n_new <= _CHUNK_LOCAL_CAP:
         return
     for _, d in drafts:
-        name = d.get("anon_name")
-        text = d.get("anon_text")
-        if d.get("safe") and name and text:
-            d["anon_text"] = text.replace(
-                f"local {name} = function", f"{name} = function", 1
-            )
+        if d.get("safe"):
+            d["safe"] = False
+            d["skip_reason"] = "chunk is at the Lua 5.1 local limit"
 
 
 def analyze_tree(analyzer) -> None:
@@ -1167,7 +1179,7 @@ def analyze_tree(analyzer) -> None:
         drafts.append((anon, details))
 
     _splice_nested(drafts, source)
-    _drop_local_if_chunk_full(drafts, chunk_locals)
+    _skip_if_chunk_full(drafts, chunk_locals)
 
     for anon, details in drafts:
         line = _node_line(source, anon)
@@ -1266,6 +1278,14 @@ def _splice_nested(drafts, source):
     greens = [d for *_, d in drafts if d.get("safe")]
     done = []
     for details in greens:
+        if details.get("rewrite_kind") != "hoist":
+            # `assign` drafts carry a synthesized `return <rhs>`. Rebuilding
+            # from the original source would drop that.
+            if any(_span_contains(details, c) for c in done if c.get("safe")):
+                details["safe"] = False
+                details["skip_reason"] = "contains nested function"
+            done.append(details)
+            continue
         contained = [c for c in done if c.get("safe") and _span_contains(details, c)]
         for child in contained:
             if any(other is not child and _span_contains(other, child) for other in contained):

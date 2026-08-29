@@ -123,7 +123,7 @@ Pay attention some of this fixes requires `--experimental` flag.
 | `vector()` in hot loop | Allocates new vector each iteration | Critical |
 | Constant conditions | `if true then` / `if false then` |
 | Unnecessary else | `if x then return end else ...` |
-| `function() ... end` skipped | Enclosing locals the caller cannot take, writes that are not a single assign, outer `...` the caller cannot pass |
+| `function() ... end` skipped | Enclosing locals the caller cannot take, writes that are not a single assign, outer `...` the caller cannot pass, long strings, local cap |
 
 
 ### DEBUG (comment out with `--fix-debug`)
@@ -268,9 +268,9 @@ end
 
 A single-statement `function() x = expr end` passed to a caller that reports success/failure becomes `return expr` plus `if ok then x = v end`, so a failed call does not store the error string into `x`.
 
-Skipped (RED, no edit): writes that are not that single-assign shape, enclosing locals where the caller cannot take extra args, outer `...` the caller cannot pass, and assign-rewrites used as `if call(...)` expressions. Own `...` hoists. pcall can pass outer `...`.
+Skipped (RED, no edit): writes that are not that single-assign shape, enclosing locals where the caller cannot take extra args, outer `...` the caller cannot pass, assign-rewrites used as `if call(...)` expressions, long strings (`[[...]]`, so reindent cannot change string data), assign-rewrites that contain a nested function, and files that would go over Lua 5.1's 200 locals. Own `...` hoists. pcall can pass outer `...`.
 
-Not part of default `--fix`.
+Not part of default `--fix`. Analysis and skip reports only run with `--hoist-anon-funcs`.
 
 ## Nil checks performance impact
 

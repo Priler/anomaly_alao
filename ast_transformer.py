@@ -43,9 +43,6 @@ class SourceEdit:
     # Same-position insertions apply high-seq first so they land later in the
     # file (end-to-start apply). Used to keep foo_anon_1 above foo_anon_2.
     seq: int = 0
-    # Anon insert: (fn_start, fn_end). Other GREEN edits inside that span
-    # get folded into the anon func.
-    anon_meta: Optional[tuple] = None
 
 
 class ASTTransformer:
@@ -90,7 +87,11 @@ class ASTTransformer:
         self.hoist_anon_funcs = bool(hoist_anon_funcs)
 
         # run analyzer with user-specified cache_threshold
-        self.analyzer = ASTAnalyzer(cache_threshold=cache_threshold, experimental=experimental)
+        self.analyzer = ASTAnalyzer(
+            cache_threshold=cache_threshold,
+            experimental=experimental,
+            hoist_anon_funcs=self.hoist_anon_funcs,
+        )
         findings = self.analyzer.analyze_file(file_path)
 
         # get source from analyzer and compute line offsets
@@ -233,9 +234,6 @@ class ASTTransformer:
         gid = self._next_group_id
         self._next_group_id += 1
         absorbed = bool(d.get('absorb_callsite'))
-        fn_start = d.get('fn_start')
-        fn_end = d.get('fn_end')
-        meta = (fn_start, fn_end) if fn_start is not None and fn_end is not None else None
         if absorbed:
             # Already pasted into an outer. Only insert this named func.
             self.edits.append(SourceEdit(
@@ -244,7 +242,6 @@ class ASTTransformer:
                 replacement=anon_text,
                 priority=100,
                 seq=int(d.get('insert_seq') or 0),
-                anon_meta=meta,
             ))
             return
         if replace_start is None or replace_end is None or replace_text is None:
@@ -257,7 +254,6 @@ class ASTTransformer:
             group_id=gid,
             is_enabler=True,
             seq=int(d.get('insert_seq') or 0),
-            anon_meta=meta,
         ))
         self.edits.append(SourceEdit(
             start_char=replace_start,

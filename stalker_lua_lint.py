@@ -78,10 +78,17 @@ from reporter import Reporter
 from models import Finding
 
 
-def analyze_file_with_timeout(file_path: Path, timeout: float, cache_threshold: int = 4, experimental: bool = False):
+def analyze_file_with_timeout(file_path: Path, timeout: float, cache_threshold: int = 4,
+                              experimental: bool = False, hoist_anon_funcs: bool = False):
     """Analyze a file with a timeout to prevent hanging on problematic files."""
     executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(analyze_file, file_path, cache_threshold=cache_threshold, experimental=experimental)
+    future = executor.submit(
+        analyze_file,
+        file_path,
+        cache_threshold=cache_threshold,
+        experimental=experimental,
+        hoist_anon_funcs=hoist_anon_funcs,
+    )
     try:
         result = future.result(timeout=timeout)
         executor.shutdown(wait=False)
@@ -94,12 +101,19 @@ def analyze_file_with_timeout(file_path: Path, timeout: float, cache_threshold: 
 
 def analyze_file_worker(args_tuple):
     """Worker function for parallel analyze_file calls."""
-    mod_name, script_path, timeout, cache_threshold, experimental = args_tuple
+    mod_name, script_path, timeout, cache_threshold, experimental, hoist_anon_funcs = args_tuple
     try:
         if timeout and timeout > 0:
-            findings = analyze_file_with_timeout(script_path, timeout, cache_threshold, experimental)
+            findings = analyze_file_with_timeout(
+                script_path, timeout, cache_threshold, experimental, hoist_anon_funcs
+            )
         else:
-            findings = analyze_file(script_path, cache_threshold=cache_threshold, experimental=experimental)
+            findings = analyze_file(
+                script_path,
+                cache_threshold=cache_threshold,
+                experimental=experimental,
+                hoist_anon_funcs=hoist_anon_funcs,
+            )
         return (mod_name, script_path, findings, None)
     except TimeoutError as e:
         return (mod_name, script_path, [], f"TimeoutError: {e}")
@@ -390,7 +404,7 @@ def main():
                     print(f"  Recovered: --fix-debug")
                 elif flag == 'hoist-anon-funcs':
                     args.hoist_anon_funcs = True
-                    print(f"  Recovered: --hoist-anon-funcs")
+                    print("  Recovered: --hoist-anon-funcs")
                 elif flag == 'experimental':
                     args.experimental = True
                     print(f"  Recovered: --experimental")
@@ -705,7 +719,8 @@ def main():
 
     # prepare work items for parallel analysis
     work_items = [
-        (mod_name, script_path, args.timeout, args.cache_threshold, args.experimental)
+        (mod_name, script_path, args.timeout, args.cache_threshold, args.experimental,
+         args.hoist_anon_funcs)
         for mod_name, script_path in all_files
     ]
 
@@ -797,12 +812,14 @@ def main():
                         script_path, args.timeout,
                         cache_threshold=args.cache_threshold,
                         experimental=args.experimental,
+                        hoist_anon_funcs=args.hoist_anon_funcs,
                     )
                 else:
                     findings = analyze_file(
                         script_path,
                         cache_threshold=args.cache_threshold,
                         experimental=args.experimental,
+                        hoist_anon_funcs=args.hoist_anon_funcs,
                     )
                 files_analyzed += 1
                 if findings:
@@ -1047,8 +1064,6 @@ def main():
         print("Tip: Run with --fix-nil to add nil guards for safe nil access patterns")
     if dead_code_fixable > 0 and not args.remove_dead_code:
         print("Tip: Run with --remove-dead-code to remove safe unreachable code")
-    if anon_hoist_count > 0 and not args.hoist_anon_funcs:
-        print("Tip: Run with --hoist-anon-funcs to hoist function() ... end to a named local")
     if (args.fix or args.fix_debug or args.fix_yellow or args.experimental or args.fix_nil or args.remove_dead_code or args.hoist_anon_funcs):
         print("Tip: Run with --revert to undo all changes using .alao-bak files")
 
